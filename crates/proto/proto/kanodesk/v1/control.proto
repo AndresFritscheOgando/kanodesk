@@ -50,16 +50,40 @@ message Hello {
   string agent = 4;
 }
 
-// SPAKE2 password authentication, bound to the transport handshake (16 §5).
-// Defined now; implemented in phase 1.
-message AuthStart {
-  bytes spake2_message = 1;
+// Session security (16 §5), in order on the control stream:
+//
+//   1. NoiseHandshake x2 (client, host): Noise IK, prologue bound to the TLS
+//      session (kanodesk_crypto::noise).
+//   2. Everything after is a Sealed message: a Noise transport ciphertext of
+//      one ControlMessage (never itself NoiseHandshake or Sealed).
+//   3. Inside: Hello exchange, then AuthStart, AuthFinish, AuthConfirm,
+//      LoginResult (kanodesk_crypto::login). The host opens video streams
+//      only after a successful LoginResult.
+
+// One Noise handshake message.
+message NoiseHandshake {
+  bytes message = 1;
 }
 
+// A Noise transport message carrying one encoded ControlMessage.
+message Sealed {
+  bytes ciphertext = 1;
+}
+
+// Client to host: one SPAKE2 message per password slot, in slot order
+// [temporary, permanent].
+message AuthStart {
+  repeated bytes spake2_messages = 1;
+}
+
+// Host to client: the host's SPAKE2 message for each slot.
 message AuthFinish {
-  bytes spake2_message = 1;
-  // Key-confirmation MAC over the handshake transcript.
-  bytes confirmation = 2;
+  repeated bytes spake2_messages = 1;
+}
+
+// Client to host: key-confirmation MAC for each slot.
+message AuthConfirm {
+  repeated bytes confirmations = 1;
 }
 
 message PeerInfo {
@@ -84,6 +108,10 @@ message LoginResult {
     PeerInfo peer_info = 1;
     LoginError error = 2;
   }
+  // With LOGIN_ERROR_RATE_LIMITED: how long to wait before retrying.
+  uint32 retry_after_ms = 3;
+  // On success: the host's key-confirmation MAC for the matched slot.
+  bytes confirmation = 4;
 }
 
 enum PermissionKind {
@@ -108,6 +136,7 @@ enum CloseReason {
   CLOSE_REASON_AUTH_FAILED = 3;
   CLOSE_REASON_REPLACED = 4;
   CLOSE_REASON_ERROR = 5;
+  CLOSE_REASON_RATE_LIMITED = 6;
 }
 
 message Close {
@@ -140,5 +169,8 @@ message ControlMessage {
     Displays displays = 11;
     SelectDisplay select_display = 12;
     SetResolution set_resolution = 13;
+    NoiseHandshake noise_handshake = 14;
+    Sealed sealed = 15;
+    AuthConfirm auth_confirm = 16;
   }
 }

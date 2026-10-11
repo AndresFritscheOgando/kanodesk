@@ -19,7 +19,8 @@
 //! - `docs/05-wire-protocol.md`
 //! - `docs/16-clone-blueprint.md`
 //!
-//! Status: MVP message set defined; auth messages are placeholders until phase 1.
+//! Status: MVP message set defined and used by the spike, including the
+//! Noise + SPAKE2 session security messages.
 
 pub mod codec;
 #[doc(hidden)]
@@ -66,6 +67,9 @@ envelope_from!(ControlMessage, control_message,
     Displays => Displays,
     SelectDisplay => SelectDisplay,
     SetResolution => SetResolution,
+    NoiseHandshake => NoiseHandshake,
+    Sealed => Sealed,
+    AuthConfirm => AuthConfirm,
 );
 
 envelope_from!(VideoMessage, video_message,

@@ -76,6 +76,20 @@ pub async fn connect(endpoint: &Endpoint, addr: SocketAddr) -> Result<Connection
     Ok(endpoint.connect(addr, SERVER_NAME)?.await?)
 }
 
+/// TLS exporter label for the Noise channel binding (RFC 5705 / RFC 8446 §7.5).
+pub const CHANNEL_BINDING_LABEL: &[u8] = b"EXPORTER-kanodesk-noise-binding-v1";
+
+/// 32 bytes unique to this QUIC/TLS session and identical on both ends. Fed
+/// into the Noise prologue, it ties end-to-end authentication to this exact
+/// transport session: a man-in-the-middle with two TLS sessions gets two
+/// different values and the Noise handshake fails.
+pub fn channel_binding(conn: &Connection) -> Result<[u8; 32], TransportError> {
+    let mut out = [0u8; 32];
+    conn.export_keying_material(&mut out, CHANNEL_BINDING_LABEL, b"")
+        .map_err(|e| TransportError::Other(format!("TLS exporter: {e:?}")))?;
+    Ok(out)
+}
+
 /// Closes one connection immediately with application code 0.
 pub fn close(conn: &Connection, reason: &[u8]) {
     conn.close(VarInt::from_u32(0), reason);
@@ -161,6 +175,28 @@ mod tests {
         assert!(reader.next().await.unwrap().is_none());
         shutdown(&client, b"done").await;
         host.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_binding_matches_per_connection() {
+        let identity = Identity::self_signed().unwrap();
+        let server = server(localhost(0), &identity).unwrap();
+        let addr = server.local_addr().unwrap();
+        let host = tokio::spawn(async move {
+            let mut bindings = Vec::new();
+            for _ in 0..2 {
+                let conn = accept(&server).await.unwrap().unwrap();
+                bindings.push(channel_binding(&conn).unwrap());
+            }
+            bindings
+        });
+        let client = client(localhost(0), ServerTrust::InsecureAcceptAny).unwrap();
+        let a = connect(&client, addr).await.unwrap();
+        let b = connect(&client, addr).await.unwrap();
+        let (ba, bb) = (channel_binding(&a).unwrap(), channel_binding(&b).unwrap());
+        let host_side = host.await.unwrap();
+        assert_eq!(host_side, vec![ba, bb], "both ends agree");
+        assert_ne!(ba, bb, "each connection is distinct");
     }
 
     #[tokio::test]

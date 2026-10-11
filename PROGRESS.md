@@ -2,6 +2,19 @@
 
 Roadmap: [docs/16-clone-blueprint.md](docs/16-clone-blueprint.md) §6. Build prompts: [docs/next-session-prompts.md](docs/next-session-prompts.md).
 
+## In progress (prompt 5: crypto) — paused 2026-10-11, uncommitted
+
+Done and tested (all workspace tests pass, fmt + clippy clean):
+- `crates/crypto`: ed25519 `DeviceIdentity` (also used for Noise via Edwards→Montgomery), `KeyStore` trait with `MemoryKeyStore` and `DpapiKeyStore` (user/machine scope, entropy bound to entry name, atomic writes), Noise IK (`noise.rs`, prologue = label + channel binding), SPAKE2 login with temporary/permanent slots and two-way key confirmation bound to the Noise handshake hash (`login.rs`), temporary/permanent passwords (`password.rs`), throttling per 04 §7 (`throttle.rs`; the prompt's "04 §5" is 2FA). Golden vectors in `golden.rs` (RFC 8032 test 1 external; the rest regression vectors). Tests cover wrong password, replay, tampering, channel-binding mismatch and identity mismatch.
+- `control.proto`: `NoiseHandshake`, `Sealed`, slot-based `AuthStart`/`AuthFinish`/`AuthConfirm`, `LoginResult.retry_after_ms`/`confirmation`, `CloseReason::RateLimited`.
+- `kanodesk_transport::endpoint::channel_binding` (TLS exporter), tested.
+- `apps/spike/src/secure.rs`: `client_session` / `host_session` running Noise → sealed `Hello` → SPAKE2 login → `LoginResult` with throttling and temporary-password rotation; in-memory tests for success, wrong password, rate limiting, rotation, wrong host key and binding mismatch.
+
+Still to do:
+1. Wire `secure.rs` into `spike-host` (DPAPI key dir, print device key + temporary password, `--password-length`, `--numeric`, `--permanent-password`; authenticate **before** replacing the active viewer; open the video stream only after login; rotate the temporary password after each session) and `spike-viewer` (`--host-key` required, `--password` or prompt, `--pin` optional; sealed control loop with `select!`).
+2. Live check of the done criterion: wrong password gets no video, right password streams; add a viewer probe that skips login and confirms no video stream is offered.
+3. Decisions/known issues for this prompt into the tables below (one key for Ed25519+X25519, TLS channel binding, client-proves-first login, permanent password stored DPAPI-protected rather than via OPAQUE), then commit.
+
 ## Done
 
 - **2026-10-11: protocol crate** (prompt 4).

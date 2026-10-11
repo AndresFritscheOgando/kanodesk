@@ -23,6 +23,7 @@
 
 pub mod overlay;
 pub mod render;
+pub mod secure;
 pub mod stats;
 
 use kanodesk_proto::hello;
