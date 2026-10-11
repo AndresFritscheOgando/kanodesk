@@ -8,7 +8,8 @@
 //!
 //! - [`v1`]: prost types generated from `proto/kanodesk/v1/*.proto`. Each
 //!   stream type has an envelope: [`v1::ControlMessage`], [`v1::VideoMessage`],
-//!   [`v1::InputMessage`]. Every stream starts with a [`v1::StreamHeader`].
+//!   [`v1::InputMessage`], and [`v1::RendezvousMessage`] for the ID server.
+//!   Every stream starts with a [`v1::StreamHeader`].
 //! - [`hello`]: the `Hello` exchange and protocol-version negotiation.
 //! - [`codec`]: `u32` big-endian length-prefixed frames with a size cap, as
 //!   tokio-util codecs.

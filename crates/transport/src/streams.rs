@@ -6,8 +6,10 @@
 //! server opens one **video** stream (unidirectional, `VideoMessage`) per
 //! display.
 
-use kanodesk_proto::v1::{ControlMessage, StreamHeader, StreamKind, VideoMessage};
-use kanodesk_proto::{MessageReader, MessageWriter};
+use kanodesk_proto::v1::{
+    ControlMessage, RendezvousMessage, StreamHeader, StreamKind, VideoMessage,
+};
+use kanodesk_proto::{FrameCodec, MessageReader, MessageWriter, ProtoCodec};
 use quinn::{Connection, RecvStream, SendStream};
 
 use crate::TransportError;
@@ -25,6 +27,10 @@ pub type ControlReader = MessageReader<RecvStream, ControlMessage>;
 pub type VideoWriter = MessageWriter<SendStream, VideoMessage>;
 /// Receives video messages for one display.
 pub type VideoReader = MessageReader<RecvStream, VideoMessage>;
+/// Sends ID-server messages.
+pub type RendezvousWriter = MessageWriter<SendStream, RendezvousMessage>;
+/// Receives ID-server messages.
+pub type RendezvousReader = MessageReader<RecvStream, RendezvousMessage>;
 
 /// A unidirectional stream opened by the peer, identified by its header.
 #[derive(Debug)]
@@ -62,7 +68,14 @@ async fn write_header(
 async fn read_header(
     recv: RecvStream,
 ) -> Result<(StreamHeader, MessageReader<RecvStream, StreamHeader>), TransportError> {
-    let mut reader = MessageReader::<_, StreamHeader>::new(recv);
+    read_header_with(recv, ProtoCodec::new()).await
+}
+
+async fn read_header_with(
+    recv: RecvStream,
+    codec: ProtoCodec<StreamHeader>,
+) -> Result<(StreamHeader, MessageReader<RecvStream, StreamHeader>), TransportError> {
+    let mut reader = MessageReader::with_codec(recv, codec);
     match reader.next().await? {
         Some(header) => Ok((header, reader)),
         None => Err(TransportError::StreamClosed),
@@ -118,4 +131,33 @@ pub async fn accept_uni(conn: &Connection) -> Result<IncomingStream, TransportEr
             "unexpected unidirectional stream {other:?}"
         ))),
     }
+}
+
+/// Device side: opens the stream to the ID server.
+pub async fn open_rendezvous(
+    conn: &Connection,
+) -> Result<(RendezvousWriter, RendezvousReader), TransportError> {
+    let (send, recv) = conn.open_bi().await?;
+    let writer = write_header(send, StreamKind::Rendezvous, 0).await?;
+    Ok((writer.into_typed(), MessageReader::new(recv)))
+}
+
+/// Largest message accepted on a rendezvous stream. Requests are small, and
+/// the ID server talks to untrusted clients, so the limit is tight.
+pub const RENDEZVOUS_MAX_FRAME: usize = 64 * 1024;
+
+/// ID-server side: accepts a device's rendezvous stream.
+pub async fn accept_rendezvous(
+    conn: &Connection,
+) -> Result<(RendezvousWriter, RendezvousReader), TransportError> {
+    let (send, recv) = conn.accept_bi().await?;
+    let codec = ProtoCodec::with_frames(FrameCodec::with_max_len(RENDEZVOUS_MAX_FRAME));
+    let (header, reader) = read_header_with(recv, codec).await?;
+    if header.kind() != StreamKind::Rendezvous {
+        return Err(TransportError::BadStreamHeader(format!(
+            "expected a rendezvous stream, got {:?}",
+            header.kind()
+        )));
+    }
+    Ok((MessageWriter::new(send), reader.into_typed()))
 }

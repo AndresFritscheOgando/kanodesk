@@ -27,7 +27,7 @@ Status: early scaffold. See [PROGRESS.md](PROGRESS.md) for what works and what's
 | `apps/service` | Windows service wrapper (`kanodesk-service`) |
 | `apps/cli` | Provisioning CLI (`kanodesk-cli`) |
 | `apps/spike` | Phase 0 spike: `spike-host` and `spike-viewer` |
-| `server/idserver` | ID/rendezvous server (`kanodesk-idserver`) |
+| `server/idserver` | ID/rendezvous server (`kanodesk-idserver`): registration, lookups, online status, connect broker |
 | `server/relay` | Relay server (`kanodesk-relay`) |
 
 ## Build
@@ -70,6 +70,26 @@ Tests that need a real interactive desktop (DXGI capture) are `#[ignore]`d becau
 ```bash
 cargo test -p kanodesk-capture -- --ignored
 ```
+
+### ID server
+
+`server/idserver` registers devices (9-digit IDs bound to their ed25519 keys), answers lookups and online queries, lets devices change ID, and brokers connect requests (with a relay assignment) over QUIC on UDP 21116. It keeps a SQLite database and its signing key (DPAPI, machine scope, on Windows; an owner-only file elsewhere) in the data directory, and prints the server key that clients must pin.
+
+```bash
+cargo run --release -p kanodesk-idserver -- serve --listen 0.0.0.0:21116 --data-dir ./idserver-data --relay relay.example.com:21117
+```
+
+Rate limits are flags of the form `BURST/SECONDS` (a burst, then one request every SECONDS): `--per-ip`, `--per-device`, `--new-ids-per-ip`, `--per-target`, `--connects-per-target`. `--trusted-network CIDR` (repeatable) exempts a network, such as a large office NAT, from the per-IP limits.
+
+Operator commands work whether the server is running or not:
+
+```bash
+cargo run --release -p kanodesk-idserver -- list --data-dir ./idserver-data
+```
+
+`show ID` prints one device; `remove ID` deletes it, frees the ID and disconnects it if online, which is how a device that lost its key gets its ID back (it registers again with a new key and asks for that ID); `set-relays HOST:PORT...` replaces the relay list and pushes it to connected devices; `relays` prints the saved list (server stopped). With the server stopped they edit the database directly; while it runs they use its admin API (`--server ADDR`, default `127.0.0.1:21116`), authenticated with the server key from the data directory, so only the server machine's administrators can use them.
+
+Clients use `kanodesk_rendezvous::RendezvousClient` with the server address and that key. The end-to-end tests in `server/idserver/tests/rendezvous.rs` show the full flow.
 
 ### Fuzzing the protocol decoder
 

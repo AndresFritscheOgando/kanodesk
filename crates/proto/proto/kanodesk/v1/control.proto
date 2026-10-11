@@ -18,6 +18,7 @@ enum StreamKind {
   STREAM_KIND_CONTROL = 1;
   STREAM_KIND_VIDEO = 2;
   STREAM_KIND_INPUT = 3;
+  STREAM_KIND_RENDEZVOUS = 4;
 }
 
 message StreamHeader {

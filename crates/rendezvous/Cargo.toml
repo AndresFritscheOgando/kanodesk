@@ -8,6 +8,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+getrandom.workspace = true
+kanodesk-crypto.workspace = true
+kanodesk-proto.workspace = true
+kanodesk-transport.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

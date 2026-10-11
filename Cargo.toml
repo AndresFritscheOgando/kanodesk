@@ -24,7 +24,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -125,7 +125,7 @@ postcard = { version = "1.1", features = ["use-std"] }
 # HTTP and server API
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 axum = "0.8"
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 
 # UI (one of these gets picked in phase 1, see PROGRESS.md)
 slint = "1.18"

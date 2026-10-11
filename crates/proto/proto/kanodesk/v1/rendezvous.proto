@@ -1,0 +1,219 @@
+// ID server ("rendezvous") protocol: device registration, lookups, online
+// status and the connect broker (03 §3, §5, §7). Our own design; RustDesk's
+// rendezvous.proto is a behaviour reference only.
+//
+// Transport: one QUIC connection per device, kept open (QUIC keep-alive).
+// The client opens one bidirectional stream (StreamHeader kind RENDEZVOUS)
+// carrying RendezvousMessage in both directions:
+//
+//   server -> client  ServerHello            (first, unsolicited)
+//   client -> server  requests, request_id > 0
+//   server -> client  replies with the same request_id, or Failure
+//   server -> client  pushes (IncomingConnect, ConfigUpdate), request_id = 0
+//
+// Operators use the same stream: after AdminAuth (a signature by the
+// server's own key), the Admin* requests are allowed.
+syntax = "proto3";
+
+package kanodesk.v1;
+
+// The server proves its identity: an ed25519 signature by the server key
+// (pinned in the client config) over
+//   "kanodesk/v1 rendezvous server" || TLS channel binding.
+message ServerHello {
+  bytes server_key = 1;
+  bytes signature = 2;
+}
+
+// Register this device. The device proves it owns `device_key` with an
+// ed25519 signature over
+//   "kanodesk/v1 rendezvous register" || TLS channel binding || id.
+// `id` is empty on first registration; the server then assigns one.
+message Register {
+  bytes device_key = 1;
+  string id = 2;
+  bytes signature = 3;
+}
+
+// What the server vouches for: this ID belongs to this key.
+message DeviceRecord {
+  string id = 1;
+  bytes device_key = 2;
+  // Unix seconds when the record was signed.
+  uint64 issued_at = 3;
+}
+
+// A DeviceRecord (encoded) with the server's ed25519 signature over
+//   "kanodesk/v1 device record" || record.
+message SignedRecord {
+  bytes record = 1;
+  bytes signature = 2;
+}
+
+message RegisterResult {
+  SignedRecord record = 1;
+}
+
+// Move this (registered) device to another, free ID. Signed by the device
+// key over "kanodesk/v1 rendezvous change id" || TLS channel binding || new_id.
+// The old ID is released. Answered with RegisterResult.
+message ChangeId {
+  string new_id = 1;
+  bytes signature = 2;
+}
+
+message Lookup {
+  string id = 1;
+}
+
+message LookupResult {
+  SignedRecord record = 1;
+  bool online = 2;
+}
+
+// Batch "is this ID online" (at most 100 IDs).
+message OnlineQuery {
+  repeated string ids = 1;
+}
+
+message OnlineResult {
+  // One entry per requested ID, in order. Unknown IDs are offline.
+  repeated bool online = 1;
+}
+
+// Controller to server: ask the host with `target_id` to connect.
+message ConnectRequest {
+  string target_id = 1;
+}
+
+// Server to controller: the request was forwarded.
+message ConnectResult {
+  SignedRecord host = 1;
+  // Public addresses as the server observed them ("ip:port").
+  string host_addr = 2;
+  string controller_addr = 3;
+  // Relay both sides should use if a direct path fails ("host:port");
+  // empty if the server has none configured.
+  string relay = 4;
+  // 16 random bytes both sides present to the relay so it can pair them.
+  bytes relay_session = 5;
+}
+
+// Server to host (push): a controller wants to connect.
+message IncomingConnect {
+  SignedRecord controller = 1;
+  string controller_addr = 2;
+  string host_addr = 3;
+  // Same relay and relay session as in the controller's ConnectResult.
+  string relay = 4;
+  bytes relay_session = 5;
+}
+
+// Server to device (push): current server-side configuration. Sent after
+// registration and whenever it changes.
+message ConfigUpdate {
+  repeated string relays = 1;
+}
+
+// Operator authentication: an ed25519 signature by the server's own signing
+// key over "kanodesk/v1 rendezvous admin" || TLS channel binding. Only
+// whoever can read the server's key store can produce it.
+message AdminAuth {
+  bytes signature = 1;
+}
+
+message AdminList {}
+
+message AdminShow {
+  string id = 1;
+}
+
+// Removes a device, frees its ID and disconnects it if online.
+message AdminRemove {
+  string id = 1;
+}
+
+// Replaces the relay list (persisted) and pushes it to connected devices.
+message AdminSetRelays {
+  repeated string relays = 1;
+}
+
+message AdminDevice {
+  string id = 1;
+  bytes device_key = 2;
+  uint64 created_at = 3;
+  uint64 last_seen = 4;
+  string last_addr = 5;
+  bool online = 6;
+}
+
+message AdminDevices {
+  repeated AdminDevice devices = 1;
+}
+
+// Generic admin acknowledgement.
+message AdminResult {
+  // AdminRemove: whether the device existed.
+  bool changed = 1;
+}
+
+message RendezvousPing {
+  uint64 timestamp_us = 1;
+}
+
+message RendezvousPong {
+  uint64 timestamp_us = 1;
+}
+
+enum RendezvousError {
+  RENDEZVOUS_ERROR_UNSPECIFIED = 0;
+  // The request needs a registered device on this connection.
+  RENDEZVOUS_ERROR_NOT_REGISTERED = 1;
+  RENDEZVOUS_ERROR_ID_NOT_FOUND = 2;
+  RENDEZVOUS_ERROR_OFFLINE = 3;
+  RENDEZVOUS_ERROR_RATE_LIMITED = 4;
+  RENDEZVOUS_ERROR_BAD_SIGNATURE = 5;
+  // The ID belongs to another key (first-come binding).
+  RENDEZVOUS_ERROR_KEY_MISMATCH = 6;
+  RENDEZVOUS_ERROR_INVALID_ID = 7;
+  RENDEZVOUS_ERROR_INVALID_REQUEST = 8;
+  RENDEZVOUS_ERROR_SERVER_ERROR = 9;
+  // ChangeId: the requested ID is already bound.
+  RENDEZVOUS_ERROR_ID_TAKEN = 10;
+  // Admin request without a valid AdminAuth on this connection.
+  RENDEZVOUS_ERROR_FORBIDDEN = 11;
+}
+
+message Failure {
+  RendezvousError error = 1;
+  // With RATE_LIMITED: how long to wait.
+  uint32 retry_after_ms = 2;
+}
+
+message RendezvousMessage {
+  uint64 request_id = 1;
+  oneof msg {
+    ServerHello server_hello = 2;
+    Register register = 3;
+    RegisterResult register_result = 4;
+    Lookup lookup = 5;
+    LookupResult lookup_result = 6;
+    OnlineQuery online_query = 7;
+    OnlineResult online_result = 8;
+    ConnectRequest connect_request = 9;
+    ConnectResult connect_result = 10;
+    IncomingConnect incoming_connect = 11;
+    RendezvousPing ping = 12;
+    RendezvousPong pong = 13;
+    Failure failure = 14;
+    ChangeId change_id = 15;
+    ConfigUpdate config_update = 16;
+    AdminAuth admin_auth = 17;
+    AdminList admin_list = 18;
+    AdminShow admin_show = 19;
+    AdminRemove admin_remove = 20;
+    AdminSetRelays admin_set_relays = 21;
+    AdminDevices admin_devices = 22;
+    AdminResult admin_result = 23;
+  }
+}

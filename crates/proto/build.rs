@@ -5,6 +5,7 @@ const FILES: &[&str] = &[
     "proto/kanodesk/v1/control.proto",
     "proto/kanodesk/v1/display.proto",
     "proto/kanodesk/v1/input.proto",
+    "proto/kanodesk/v1/rendezvous.proto",
     "proto/kanodesk/v1/stats.proto",
     "proto/kanodesk/v1/video.proto",
 ];

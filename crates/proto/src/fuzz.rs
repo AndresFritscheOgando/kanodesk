@@ -8,7 +8,7 @@ use prost::Message;
 use tokio_util::codec::Decoder;
 
 use crate::codec::{FrameCodec, ProtoCodec};
-use crate::v1::{ControlMessage, InputMessage, StreamHeader, VideoMessage};
+use crate::v1::{ControlMessage, InputMessage, RendezvousMessage, StreamHeader, VideoMessage};
 
 /// Payload limit used while fuzzing, small enough to reach the size check often.
 pub const FUZZ_MAX_LEN: usize = 64 * 1024;
@@ -38,6 +38,7 @@ pub fn decode_all(data: &[u8]) {
                     check::<ControlMessage>(&frame);
                     check::<VideoMessage>(&frame);
                     check::<InputMessage>(&frame);
+                    check::<RendezvousMessage>(&frame);
                 }
                 Ok(None) => break,
                 // A real reader closes the stream on error.

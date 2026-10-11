@@ -7,8 +7,11 @@
 //!   Use [`DpapiScope::LocalMachine`] for the service (any process on the
 //!   machine can unprotect, but the files are ACL-protected) and
 //!   [`DpapiScope::CurrentUser`] for per-user apps.
+//! - [`FileKeyStore`]: plain files, owner-only (mode 0600) on Unix. For
+//!   servers on OSes without DPAPI; protection is the file permissions alone.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use zeroize::Zeroizing;
@@ -66,6 +69,78 @@ impl KeyStore for MemoryKeyStore {
         check_name(name)?;
         self.items.lock().expect("not poisoned").remove(name);
         Ok(())
+    }
+}
+
+/// Secrets as plain files in one directory. On Unix the directory is created
+/// with mode 0700 and files with 0600; on Windows prefer `DpapiKeyStore`.
+#[derive(Debug, Clone)]
+pub struct FileKeyStore {
+    dir: PathBuf,
+}
+
+impl FileKeyStore {
+    /// A store in `dir` (created if missing).
+    pub fn new(dir: impl Into<PathBuf>) -> Result<Self, CryptoError> {
+        let dir = dir.into();
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&dir)
+            .map_err(|e| CryptoError::KeyStore(format!("create {}: {e}", dir.display())))?;
+        Ok(FileKeyStore { dir })
+    }
+
+    /// The directory holding the files.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(format!("{name}.key"))
+    }
+}
+
+impl KeyStore for FileKeyStore {
+    fn load(&self, name: &str) -> Result<Option<Zeroizing<Vec<u8>>>, CryptoError> {
+        check_name(name)?;
+        match std::fs::read(self.path(name)) {
+            Ok(data) => Ok(Some(Zeroizing::new(data))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(CryptoError::KeyStore(format!("read {name}: {e}"))),
+        }
+    }
+
+    fn store(&self, name: &str, secret: &[u8]) -> Result<(), CryptoError> {
+        use std::io::Write;
+        check_name(name)?;
+        let tmp = self.dir.join(format!("{name}.key.tmp"));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(secret).and_then(|()| f.sync_all()))
+            .and_then(|()| std::fs::rename(&tmp, self.path(name)))
+            .map_err(|e| CryptoError::KeyStore(format!("write {name}: {e}")))
+    }
+
+    fn delete(&self, name: &str) -> Result<(), CryptoError> {
+        check_name(name)?;
+        match std::fs::remove_file(self.path(name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CryptoError::KeyStore(format!("delete {name}: {e}"))),
+        }
     }
 }
 
@@ -300,6 +375,39 @@ mod tests {
         for bad in ["", "A", "../x", "a/b", "a.b", "a b", &"a".repeat(65)] {
             assert!(check_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn file_store_round_trip() {
+        let mut name = [0u8; 8];
+        crate::random_bytes(&mut name).unwrap();
+        let dir = std::env::temp_dir().join(format!("kanodesk-filestore-{}", crate::to_hex(&name)));
+        let store = FileKeyStore::new(&dir).unwrap();
+        assert!(store.load("k").unwrap().is_none());
+        store.store("k", b"secret").unwrap();
+        assert_eq!(store.load("k").unwrap().unwrap().as_slice(), b"secret");
+        store.store("k", b"replaced").unwrap();
+        assert_eq!(store.load("k").unwrap().unwrap().as_slice(), b"replaced");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("k.key"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // A reopened store sees the same data.
+        let (id, _) = crate::DeviceIdentity::load_or_create(&store).unwrap();
+        let reopened = FileKeyStore::new(store.dir()).unwrap();
+        let (again, created) = crate::DeviceIdentity::load_or_create(&reopened).unwrap();
+        assert!(!created);
+        assert_eq!(id.public_key(), again.public_key());
+        store.delete("k").unwrap();
+        store.delete("k").unwrap();
+        assert!(store.load("k").unwrap().is_none());
+        assert!(store.store("../escape", b"x").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

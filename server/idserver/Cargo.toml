@@ -10,8 +10,18 @@ publish.workspace = true
 [[bin]]
 name = "kanodesk-idserver"
 path = "src/main.rs"
+# main.rs only parses arguments; tests live in the library and tests/.
+test = false
 
 [dependencies]
+getrandom.workspace = true
+kanodesk-crypto.workspace = true
+kanodesk-proto.workspace = true
+kanodesk-rendezvous.workspace = true
+kanodesk-transport.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true
