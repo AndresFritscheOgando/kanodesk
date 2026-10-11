@@ -29,10 +29,13 @@ mod host {
 
     use kanodesk_capture::{Capturer, DisplayInfo, PlatformCapturer, clock, primary_display};
     use kanodesk_codec::{Encoder, EncoderConfig, I420Frame, Vp9Encoder, convert};
-    use kanodesk_spike::DEFAULT_ADDR;
+    use kanodesk_proto::hello;
+    use kanodesk_proto::v1::{
+        self, Capability, CloseReason, Codec, ControlMessage, VideoMessage, control_message,
+    };
     use kanodesk_spike::stats::Samples;
-    use kanodesk_spike::wire::{Control, VideoHeader, encode_video};
-    use kanodesk_transport::framing::{read_frame, write_frame};
+    use kanodesk_spike::{DEFAULT_ADDR, spike_hello};
+    use kanodesk_transport::streams::{ControlReader, ControlWriter};
     use kanodesk_transport::tls::Identity;
     use kanodesk_transport::{Connection, endpoint, streams};
     use tokio::sync::mpsc;
@@ -127,12 +130,55 @@ mod host {
         Ok(found.ok_or("display not found")?.clone())
     }
 
-    /// Serves one viewer: capture thread → channel → video stream; control
-    /// stream → keyframe flag.
+    /// Exchanges `Hello` on the control stream and checks the viewer can
+    /// take what this host sends. On a mismatch the viewer gets a `Close`.
+    async fn handshake(
+        send: &mut ControlWriter,
+        recv: &mut ControlReader,
+    ) -> Result<hello::Negotiated, BoxError> {
+        let theirs = match recv.next().await? {
+            Some(ControlMessage {
+                msg: Some(control_message::Msg::Hello(h)),
+            }) => h,
+            other => return Err(format!("expected Hello, got {other:?}").into()),
+        };
+        let ours = spike_hello();
+        send.send(&ours.clone().into()).await?;
+        let refusal = match hello::negotiate(&ours, &theirs) {
+            Ok(n) if n.has(Capability::VideoVp9) => {
+                println!(
+                    "viewer agent {:?}: protocol v{}, capabilities {:?}",
+                    theirs.agent, n.version, n.capabilities
+                );
+                return Ok(n);
+            }
+            Ok(_) => (CloseReason::Error, "viewer cannot decode VP9".to_owned()),
+            Err(e) => (CloseReason::IncompatibleVersion, e.to_string()),
+        };
+        send.send(
+            &v1::Close {
+                reason: refusal.0 as i32,
+                detail: refusal.1.clone(),
+            }
+            .into(),
+        )
+        .await?;
+        // Let the Close reach the viewer before the connection goes away.
+        let stream = send.get_mut();
+        stream.finish()?;
+        let _ = tokio::time::timeout(Duration::from_secs(1), stream.stopped()).await;
+        Err(refusal.1.into())
+    }
+
+    /// Serves one viewer: `Hello` exchange, then capture thread → channel →
+    /// video stream, and control stream → keyframe flag.
     async fn serve(conn: Connection, settings: Settings) -> Result<(), BoxError> {
+        let (mut control_send, mut control_recv) = streams::accept_control(&conn).await?;
+        handshake(&mut control_send, &mut control_recv).await?;
+
         let display = pick_display(&settings)?;
         let keyframe = Arc::new(AtomicBool::new(true));
-        let (frames_tx, mut frames_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (frames_tx, mut frames_rx) = mpsc::channel::<VideoMessage>(4);
 
         let capture = {
             let keyframe = keyframe.clone();
@@ -147,17 +193,20 @@ mod host {
         };
 
         let control = {
-            let conn = conn.clone();
             let keyframe = keyframe.clone();
             tokio::spawn(async move {
-                let (_send, mut recv) = streams::accept_control(&conn).await?;
-                let mut buf = Vec::new();
-                while read_frame(&mut recv, &mut buf).await? {
-                    match Control::decode(&buf) {
-                        Ok(Control::RequestKeyframe { .. }) => {
+                // Keep the send half alive for the session.
+                let _send = control_send;
+                while let Some(msg) = control_recv.next().await? {
+                    match msg.msg {
+                        Some(control_message::Msg::KeyframeRequest(_)) => {
                             keyframe.store(true, Ordering::Relaxed)
                         }
-                        Err(e) => eprintln!("control: {e}"),
+                        Some(control_message::Msg::Close(c)) => {
+                            println!("viewer closed: {:?} {}", c.reason(), c.detail);
+                            break;
+                        }
+                        _ => {}
                     }
                 }
                 Ok::<_, BoxError>(())
@@ -167,7 +216,7 @@ mod host {
         let mut video = streams::open_video(&conn, display.id).await?;
         let result: Result<(), BoxError> = async {
             while let Some(msg) = frames_rx.recv().await {
-                write_frame(&mut video, &msg).await?;
+                video.send(&msg).await?;
             }
             Ok(())
         }
@@ -185,7 +234,7 @@ mod host {
     fn capture_loop(
         display: &DisplayInfo,
         settings: &Settings,
-        frames: &mpsc::Sender<Vec<u8>>,
+        frames: &mpsc::Sender<VideoMessage>,
         keyframe: &AtomicBool,
     ) -> Result<(), BoxError> {
         let mut capturer = PlatformCapturer::open(display)?;
@@ -194,7 +243,7 @@ mod host {
         let mut yuv = I420Frame::default();
         let mut capture_us = 0u64;
         let mut have_image = false;
-        let mut frame_no = 0u64;
+        let mut seq = 0u64;
 
         let mut encode_ms = Samples::default();
         let (mut sent, mut bytes, mut keys) = (0u64, 0u64, 0u64);
@@ -252,6 +301,15 @@ mod host {
                     size.0, size.1, config.bitrate_kbps, config.speed, config.threads, settings.fps
                 );
                 encoder = Some(Vp9Encoder::new(config)?);
+                let start = v1::StreamStart {
+                    display: display.id,
+                    codec: Codec::Vp9 as i32,
+                    width: size.0,
+                    height: size.1,
+                };
+                if frames.blocking_send(start.into()).is_err() {
+                    return Ok(());
+                }
             }
             let encoder = encoder.as_mut().expect("created above");
 
@@ -261,22 +319,21 @@ mod host {
             encode_ms.push(t.elapsed().as_secs_f64() * 1000.0);
             let encoded_us = clock::now_us();
             for p in packets {
-                let header = VideoHeader {
-                    frame_no,
-                    capture_us,
-                    encoded_us,
-                    width: size.0,
-                    height: size.1,
-                    key: p.key,
-                };
-                frame_no += 1;
                 sent += 1;
                 bytes += p.data.len() as u64;
                 keys += p.key as u64;
-                if frames
-                    .blocking_send(encode_video(&header, &p.data))
-                    .is_err()
-                {
+                let frame = v1::VideoFrame {
+                    display: display.id,
+                    seq,
+                    pts_ms: p.pts_ms,
+                    key: p.key,
+                    data: p.data,
+                    capture_us,
+                    host_delay_us: encoded_us.saturating_sub(capture_us).min(u32::MAX as u64)
+                        as u32,
+                };
+                seq += 1;
+                if frames.blocking_send(frame.into()).is_err() {
                     return Ok(());
                 }
             }

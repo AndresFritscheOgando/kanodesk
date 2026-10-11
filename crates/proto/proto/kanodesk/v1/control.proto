@@ -1,0 +1,144 @@
+// Control stream messages (16 §8 "Control") and the per-stream header.
+//
+// Protocol versioning: each peer sends Hello first on the control stream with
+// the range of protocol versions it speaks and its capabilities. Both sides
+// use the highest version in the overlap of the two ranges and the
+// intersection of capabilities (see kanodesk_proto::hello).
+syntax = "proto3";
+
+package kanodesk.v1;
+
+import "kanodesk/v1/display.proto";
+import "kanodesk/v1/stats.proto";
+import "kanodesk/v1/video.proto";
+
+// What a QUIC stream carries; sent as the first frame on every stream (16 §4).
+enum StreamKind {
+  STREAM_KIND_UNSPECIFIED = 0;
+  STREAM_KIND_CONTROL = 1;
+  STREAM_KIND_VIDEO = 2;
+  STREAM_KIND_INPUT = 3;
+}
+
+message StreamHeader {
+  StreamKind kind = 1;
+  // Display id, for video streams.
+  uint32 display = 2;
+}
+
+// Optional features a peer supports. Unknown values are ignored.
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_VIDEO_VP9 = 1;
+  CAPABILITY_VIDEO_H264 = 2;
+  CAPABILITY_VIDEO_AV1 = 3;
+  CAPABILITY_KEYFRAME_REQUEST = 4;
+  CAPABILITY_RECEIVER_REPORT = 5;
+  CAPABILITY_INPUT_MOUSE = 6;
+  CAPABILITY_INPUT_KEYBOARD = 7;
+  CAPABILITY_MULTI_DISPLAY = 8;
+  CAPABILITY_SET_RESOLUTION = 9;
+}
+
+message Hello {
+  // Highest protocol version this peer speaks.
+  uint32 version = 1;
+  // Lowest protocol version this peer still accepts.
+  uint32 min_version = 2;
+  repeated Capability capabilities = 3;
+  // Software name and version, for logs only (for example "kanodesk/0.1.0").
+  string agent = 4;
+}
+
+// SPAKE2 password authentication, bound to the transport handshake (16 §5).
+// Defined now; implemented in phase 1.
+message AuthStart {
+  bytes spake2_message = 1;
+}
+
+message AuthFinish {
+  bytes spake2_message = 1;
+  // Key-confirmation MAC over the handshake transcript.
+  bytes confirmation = 2;
+}
+
+message PeerInfo {
+  string hostname = 1;
+  string username = 2;
+  string platform = 3;
+  string agent = 4;
+  Displays displays = 5;
+  repeated Codec codecs = 6;
+}
+
+enum LoginError {
+  LOGIN_ERROR_UNSPECIFIED = 0;
+  LOGIN_ERROR_WRONG_PASSWORD = 1;
+  LOGIN_ERROR_RATE_LIMITED = 2;
+  LOGIN_ERROR_DENIED = 3;
+  LOGIN_ERROR_TIMEOUT = 4;
+}
+
+message LoginResult {
+  oneof result {
+    PeerInfo peer_info = 1;
+    LoginError error = 2;
+  }
+}
+
+enum PermissionKind {
+  PERMISSION_KIND_UNSPECIFIED = 0;
+  PERMISSION_KIND_KEYBOARD = 1;
+  PERMISSION_KIND_MOUSE = 2;
+  PERMISSION_KIND_CLIPBOARD = 3;
+  PERMISSION_KIND_AUDIO = 4;
+  PERMISSION_KIND_FILE = 5;
+}
+
+// Host to viewer: a permission was granted or revoked (live, 16 §5 item 8).
+message Permission {
+  PermissionKind kind = 1;
+  bool enabled = 2;
+}
+
+enum CloseReason {
+  CLOSE_REASON_UNSPECIFIED = 0;
+  CLOSE_REASON_USER = 1;
+  CLOSE_REASON_INCOMPATIBLE_VERSION = 2;
+  CLOSE_REASON_AUTH_FAILED = 3;
+  CLOSE_REASON_REPLACED = 4;
+  CLOSE_REASON_ERROR = 5;
+}
+
+message Close {
+  CloseReason reason = 1;
+  string detail = 2;
+}
+
+message Ping {
+  uint64 timestamp_us = 1;
+}
+
+message Pong {
+  // Echo of Ping.timestamp_us.
+  uint64 timestamp_us = 1;
+}
+
+// Envelope for the bidirectional control stream.
+message ControlMessage {
+  oneof msg {
+    Hello hello = 1;
+    AuthStart auth_start = 2;
+    AuthFinish auth_finish = 3;
+    LoginResult login_result = 4;
+    Permission permission = 5;
+    Close close = 6;
+    Ping ping = 7;
+    Pong pong = 8;
+    KeyframeRequest keyframe_request = 9;
+    ReceiverReport receiver_report = 10;
+    Displays displays = 11;
+    SelectDisplay select_display = 12;
+    SetResolution set_resolution = 13;
+  }
+}

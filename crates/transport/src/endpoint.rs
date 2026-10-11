@@ -10,8 +10,8 @@ use quinn::{Connection, Endpoint, IdleTimeout, TransportConfig, VarInt};
 use crate::TransportError;
 use crate::tls::{Identity, PinVerifier, SERVER_NAME, ServerTrust};
 
-/// ALPN protocol id. Bumped whenever the spike wire format changes.
-pub const ALPN: &[u8] = b"kanodesk-spike/0";
+/// ALPN protocol id. Not versioned: versions are negotiated by `Hello` (kanodesk_proto::hello).
+pub const ALPN: &[u8] = b"kanodesk";
 
 /// How long a silent connection survives.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -97,12 +97,22 @@ pub async fn accept(endpoint: &Endpoint) -> Option<Result<Connection, TransportE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::framing::{read_frame, write_frame};
-    use crate::streams::{StreamKind, accept_control, accept_uni, open_control, open_video};
+    use crate::streams::{IncomingStream, accept_control, accept_uni, open_control, open_video};
+    use kanodesk_proto::v1::{self, ControlMessage, VideoMessage};
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     fn localhost(port: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    }
+
+    fn frame(seq: u64) -> VideoMessage {
+        v1::VideoFrame {
+            display: 3,
+            seq,
+            data: vec![seq as u8; 1000 * seq as usize],
+            ..Default::default()
+        }
+        .into()
     }
 
     #[tokio::test]
@@ -114,18 +124,18 @@ mod tests {
         let host = tokio::spawn(async move {
             let conn = accept(&server).await.unwrap().unwrap();
             let (mut ctl_send, mut ctl_recv) = accept_control(&conn).await.unwrap();
-            let mut buf = Vec::new();
-            assert!(read_frame(&mut ctl_recv, &mut buf).await.unwrap());
-            assert_eq!(buf, b"keyframe please");
-            write_frame(&mut ctl_send, b"ok").await.unwrap();
+            let request = ctl_recv.next().await.unwrap().unwrap();
+            assert_eq!(request, v1::KeyframeRequest { display: 3 }.into());
+            ctl_send
+                .send(&v1::Pong { timestamp_us: 7 }.into())
+                .await
+                .unwrap();
 
             let mut video = open_video(&conn, 3).await.unwrap();
-            for i in 0u8..5 {
-                write_frame(&mut video, &vec![i; 1000 * i as usize])
-                    .await
-                    .unwrap();
+            for seq in 0..5 {
+                video.send(&frame(seq)).await.unwrap();
             }
-            video.finish().unwrap();
+            video.into_inner().finish().unwrap();
             // Keep the connection open until the client has read everything.
             conn.closed().await;
         });
@@ -133,20 +143,22 @@ mod tests {
         let client = client(localhost(0), ServerTrust::Pinned(identity.fingerprint())).unwrap();
         let conn = connect(&client, addr).await.unwrap();
         let (mut ctl_send, mut ctl_recv) = open_control(&conn).await.unwrap();
-        write_frame(&mut ctl_send, b"keyframe please")
+        ctl_send
+            .send(&v1::KeyframeRequest { display: 3 }.into())
             .await
             .unwrap();
-        let mut buf = Vec::new();
-        assert!(read_frame(&mut ctl_recv, &mut buf).await.unwrap());
-        assert_eq!(buf, b"ok");
+        let reply: ControlMessage = ctl_recv.next().await.unwrap().unwrap();
+        assert_eq!(reply, v1::Pong { timestamp_us: 7 }.into());
 
-        let (kind, mut video) = accept_uni(&conn).await.unwrap();
-        assert_eq!(kind, StreamKind::Video { display: 3 });
-        for i in 0u8..5 {
-            assert!(read_frame(&mut video, &mut buf).await.unwrap());
-            assert_eq!(buf, vec![i; 1000 * i as usize]);
+        let IncomingStream::Video {
+            display,
+            mut reader,
+        } = accept_uni(&conn).await.unwrap();
+        assert_eq!(display, 3);
+        for seq in 0..5 {
+            assert_eq!(reader.next().await.unwrap().unwrap(), frame(seq));
         }
-        assert!(!read_frame(&mut video, &mut buf).await.unwrap());
+        assert!(reader.next().await.unwrap().is_none());
         shutdown(&client, b"done").await;
         host.await.unwrap();
     }

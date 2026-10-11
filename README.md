@@ -71,6 +71,24 @@ Tests that need a real interactive desktop (DXGI capture) are `#[ignore]`d becau
 cargo test -p kanodesk-capture -- --ignored
 ```
 
+### Fuzzing the protocol decoder
+
+`crates/proto/fuzz` is a cargo-fuzz project (its own workspace, nightly only). The same check also runs on stable as a proptest. One-time setup:
+
+```bash
+rustup toolchain install nightly --profile minimal
+```
+
+```bash
+cargo install cargo-fuzz --locked
+```
+
+On Windows, AddressSanitizer needs the MSVC runtime DLL on `PATH`: add `VC\Tools\MSVC\<version>\bin\Hostx64\x64` from your Visual Studio Build Tools install. Then, from `crates/proto`:
+
+```bash
+cargo +nightly fuzz run decode_frames -- -max_total_time=60
+```
+
 ### Phase 0 spike: stream your screen
 
 Two binaries in `apps/spike`. Start the host; it prints a certificate fingerprint and the exact viewer command:

@@ -1,0 +1,52 @@
+// Video stream messages (16 §8 "Video"). Our own schema; RustDesk's
+// message.proto is a field-level reference only.
+syntax = "proto3";
+
+package kanodesk.v1;
+
+// Video codecs. Values are stable on the wire.
+enum Codec {
+  CODEC_UNSPECIFIED = 0;
+  CODEC_VP9 = 1;
+  CODEC_H264 = 2;
+  CODEC_AV1 = 3;
+}
+
+// Sent first on a video stream, and again before the keyframe that follows
+// any change of codec or size.
+message StreamStart {
+  uint32 display = 1;
+  Codec codec = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+}
+
+// One encoded frame.
+message VideoFrame {
+  uint32 display = 1;
+  // Sequence number per stream, starting at 0. Gaps mean frames were dropped.
+  uint64 seq = 2;
+  // Presentation time in milliseconds on the host's clock.
+  int64 pts_ms = 3;
+  // True if the frame decodes on its own.
+  bool key = 4;
+  bytes data = 5;
+  // Host monotonic clock (µs) when the captured image was presented.
+  uint64 capture_us = 6;
+  // Time from capture to hand-off to the transport, in µs (capture wait + encode).
+  uint32 host_delay_us = 7;
+}
+
+// Viewer to host: send a keyframe for this display soon (on connect, after a
+// decode error, after a window reopens).
+message KeyframeRequest {
+  uint32 display = 1;
+}
+
+// Envelope for the server-to-client video stream.
+message VideoMessage {
+  oneof msg {
+    StreamStart stream_start = 1;
+    VideoFrame frame = 2;
+  }
+}

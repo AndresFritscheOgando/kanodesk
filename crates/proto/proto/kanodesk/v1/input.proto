@@ -1,0 +1,84 @@
+// Input messages (16 §8 "Input"), client to host. Semantics follow 07.
+syntax = "proto3";
+
+package kanodesk.v1;
+
+enum MouseKind {
+  MOUSE_KIND_UNSPECIFIED = 0;
+  // Absolute move to (x, y) in display pixels.
+  MOUSE_KIND_MOVE = 1;
+  // Relative move by (dx, dy), for games and locked pointers.
+  MOUSE_KIND_MOVE_RELATIVE = 2;
+  MOUSE_KIND_BUTTON_DOWN = 3;
+  MOUSE_KIND_BUTTON_UP = 4;
+  // Wheel by (dx, dy) in wheel notches × 120 (Windows WHEEL_DELTA units).
+  MOUSE_KIND_WHEEL = 5;
+}
+
+// Mouse buttons as bit flags in MouseEvent.buttons.
+enum MouseButton {
+  MOUSE_BUTTON_NONE = 0;
+  MOUSE_BUTTON_LEFT = 1;
+  MOUSE_BUTTON_RIGHT = 2;
+  MOUSE_BUTTON_MIDDLE = 4;
+  MOUSE_BUTTON_BACK = 8;
+  MOUSE_BUTTON_FORWARD = 16;
+}
+
+message MouseEvent {
+  MouseKind kind = 1;
+  // Bit set of MouseButton values.
+  uint32 buttons = 2;
+  // Absolute position, relative to the display's top-left corner.
+  int32 x = 3;
+  int32 y = 4;
+  // Relative motion or wheel amount.
+  int32 dx = 5;
+  int32 dy = 6;
+  uint32 display = 7;
+}
+
+// Keyboard handling mode (07).
+enum KeyMode {
+  KEY_MODE_UNSPECIFIED = 0;
+  // Physical key positions (scan codes); the host's layout applies.
+  KEY_MODE_MAP = 1;
+  // Characters as typed on the client's layout.
+  KEY_MODE_TRANSLATE = 2;
+}
+
+// Modifier keys as bit flags in KeyEvent.modifiers.
+enum Modifier {
+  MODIFIER_NONE = 0;
+  MODIFIER_SHIFT = 1;
+  MODIFIER_CONTROL = 2;
+  MODIFIER_ALT = 4;
+  MODIFIER_META = 8;
+  MODIFIER_CAPS_LOCK = 16;
+  MODIFIER_NUM_LOCK = 32;
+}
+
+message KeyEvent {
+  // USB HID usage code (page 0x07) of the physical key.
+  uint32 code = 1;
+  bool down = 2;
+  // Bit set of Modifier values held at the time of the event.
+  uint32 modifiers = 3;
+  KeyMode mode = 4;
+}
+
+// Text to type as-is (IME output, paste-as-keystrokes).
+message TextInput {
+  string text = 1;
+}
+
+// Envelope for client-to-host input.
+message InputMessage {
+  // Sequence number, so datagram delivery can drop stale events.
+  uint64 seq = 1;
+  oneof msg {
+    MouseEvent mouse = 2;
+    KeyEvent key = 3;
+    TextInput text = 4;
+  }
+}

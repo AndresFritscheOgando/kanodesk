@@ -11,10 +11,11 @@
 //!   certificate. The client pins the server certificate by fingerprint
 //!   ([`tls::Fingerprint`]). This stands in for the Noise IK handshake and
 //!   signed device keys of phase 1 (16 §5).
-//! - [`framing`]: `u32` big-endian length-prefixed frames with a size cap.
 //! - [`streams`]: the stream layout. The client opens one bidirectional
 //!   **control** stream; the server opens one unidirectional **video** stream
-//!   per display. Each stream starts with a small header frame saying what it is.
+//!   per display. Each stream starts with a `kanodesk_proto` `StreamHeader`
+//!   and then carries that stream's envelope type, framed by
+//!   `kanodesk_proto::codec`.
 //!
 //! Video frames currently travel reliably on the video stream. 16 §4 wants them
 //! unreliable with keyframe recovery; that comes with QoS work.
@@ -26,7 +27,6 @@
 //! Status: phase 0 spike (see `PROGRESS.md`).
 
 pub mod endpoint;
-pub mod framing;
 pub mod streams;
 pub mod tls;
 
@@ -44,17 +44,9 @@ pub enum TransportError {
     /// Socket or stream I/O failed.
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
-    /// A frame header announced more than [`framing::MAX_FRAME_LEN`] bytes.
-    #[error("frame of {len} bytes exceeds the {max}-byte limit")]
-    FrameTooLarge {
-        /// Announced or attempted length.
-        len: usize,
-        /// The limit.
-        max: usize,
-    },
-    /// The stream ended in the middle of a frame.
-    #[error("stream ended mid-frame")]
-    Truncated,
+    /// Framing or message decoding failed.
+    #[error("codec: {0}")]
+    Codec(#[from] kanodesk_proto::CodecError),
     /// A stream header was missing or malformed.
     #[error("bad stream header: {0}")]
     BadStreamHeader(String),

@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["crates/proto/fuzz"]
 members = [
     "crates/proto",
     "crates/crypto",
@@ -49,12 +50,13 @@ kanodesk-platform = { path = "crates/platform" }
 
 # Async
 tokio = { version = "1.53", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1.12"
 
 # Protobuf
 prost = "0.14"
 prost-build = "0.14"
+protox = "0.10"
 
 # Transport and NAT traversal
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }

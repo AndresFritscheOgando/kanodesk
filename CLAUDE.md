@@ -18,6 +18,7 @@ KanoDesk is a remote-desktop app in Rust inspired by RustDesk. `docs/` is the sp
 - Packages are named `kanodesk-<dir>` (for example `crates/proto` → `kanodesk-proto`). Shared metadata comes from `[workspace.package]`.
 - Add third-party dependencies to `[workspace.dependencies]` in the root `Cargo.toml` first, then opt in from the member with `foo.workspace = true`.
 - Native C libraries come from vcpkg in manifest mode: add them to `vcpkg.json` (pinned with `overrides`), install with `vcpkg install --triplet x64-windows-static-md`, and point build scripts at `./vcpkg_installed/` through `[env]` in `.cargo/config.toml`.
+- Wire messages live in `crates/proto/proto/kanodesk/v1/*.proto` (compiled by protox in `build.rs`; no `protoc` needed). Never renumber a field or enum value, or reuse a removed one; add new ones and bump `PROTOCOL_VERSION` in `kanodesk_proto::hello` when behaviour changes incompatibly.
 - Tests that need real hardware or an interactive desktop are `#[ignore = "..."]`, so CI stays green. Run them locally with `-- --ignored` before calling such work done.
 - Each crate's `lib.rs` starts with a module doc comment that gives its purpose and the `docs/` files that specify it, mirrored in `SPEC_DOCS`.
 - The workspace enables `missing_docs`, so public items need doc comments.

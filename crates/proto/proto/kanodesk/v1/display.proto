@@ -1,0 +1,33 @@
+// Display management (16 §8 "Display"; 06 §5–6).
+syntax = "proto3";
+
+package kanodesk.v1;
+
+message DisplayInfo {
+  uint32 id = 1;
+  string name = 2;
+  int32 x = 3;
+  int32 y = 4;
+  uint32 width = 5;
+  uint32 height = 6;
+  bool primary = 7;
+  // Scale factor in percent (100 = 96 DPI).
+  uint32 scale_percent = 8;
+}
+
+// Host to viewer: the host's displays, sent after login and whenever they change.
+message Displays {
+  repeated DisplayInfo displays = 1;
+}
+
+// Viewer to host: stream these displays (empty = primary only).
+message SelectDisplay {
+  repeated uint32 ids = 1;
+}
+
+// Viewer to host: change a display's resolution for the session.
+message SetResolution {
+  uint32 display = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+}

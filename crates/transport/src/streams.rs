@@ -1,137 +1,121 @@
 //! The QUIC stream layout (16 §4), as far as the spike needs it.
 //!
-//! Every stream starts with one header frame: the magic `KD`, a kind byte,
-//! and kind-specific fields. The client opens the **control** stream
-//! (bidirectional, high priority); the server opens one **video** stream
-//! (unidirectional) per display.
+//! Every stream starts with one `StreamHeader` message and then carries its
+//! envelope type, all framed by `kanodesk_proto::codec`. The client opens the
+//! **control** stream (bidirectional, high priority, `ControlMessage`); the
+//! server opens one **video** stream (unidirectional, `VideoMessage`) per
+//! display.
 
+use kanodesk_proto::v1::{ControlMessage, StreamHeader, StreamKind, VideoMessage};
+use kanodesk_proto::{MessageReader, MessageWriter};
 use quinn::{Connection, RecvStream, SendStream};
 
 use crate::TransportError;
-use crate::framing::{read_frame, write_frame};
-
-const MAGIC: &[u8; 2] = b"KD";
-const KIND_CONTROL: u8 = 0;
-const KIND_VIDEO: u8 = 1;
 
 /// Priority for the control stream. Higher is sent first (quinn semantics).
 pub const CONTROL_PRIORITY: i32 = 10;
 /// Priority for video streams.
 pub const VIDEO_PRIORITY: i32 = 0;
 
-/// What a stream carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamKind {
-    /// Control messages, both directions.
-    Control,
-    /// Encoded video for one display, server to client.
+/// Sends control messages.
+pub type ControlWriter = MessageWriter<SendStream, ControlMessage>;
+/// Receives control messages.
+pub type ControlReader = MessageReader<RecvStream, ControlMessage>;
+/// Sends video messages for one display.
+pub type VideoWriter = MessageWriter<SendStream, VideoMessage>;
+/// Receives video messages for one display.
+pub type VideoReader = MessageReader<RecvStream, VideoMessage>;
+
+/// A unidirectional stream opened by the peer, identified by its header.
+#[derive(Debug)]
+pub enum IncomingStream {
+    /// Encoded video for one display.
     Video {
         /// Display id on the server.
         display: u32,
+        /// The stream's messages.
+        reader: VideoReader,
     },
 }
 
-impl StreamKind {
-    /// Header bytes for this kind.
-    pub fn encode(self) -> Vec<u8> {
-        let mut out = MAGIC.to_vec();
-        match self {
-            StreamKind::Control => out.push(KIND_CONTROL),
-            StreamKind::Video { display } => {
-                out.push(KIND_VIDEO);
-                out.extend_from_slice(&display.to_be_bytes());
-            }
-        }
-        out
-    }
-
-    /// Parses header bytes.
-    pub fn decode(bytes: &[u8]) -> Result<Self, TransportError> {
-        let bad = |why: &str| TransportError::BadStreamHeader(why.to_owned());
-        if bytes.len() < 3 || &bytes[..2] != MAGIC {
-            return Err(bad("missing magic"));
-        }
-        match (bytes[2], &bytes[3..]) {
-            (KIND_CONTROL, []) => Ok(StreamKind::Control),
-            (KIND_VIDEO, rest) if rest.len() == 4 => Ok(StreamKind::Video {
-                display: u32::from_be_bytes(rest.try_into().expect("length checked")),
-            }),
-            (KIND_CONTROL | KIND_VIDEO, _) => Err(bad("wrong length")),
-            (kind, _) => Err(bad(&format!("unknown kind {kind}"))),
-        }
-    }
+fn set_priority(stream: &SendStream, priority: i32) -> Result<(), TransportError> {
+    stream
+        .set_priority(priority)
+        .map_err(|e| TransportError::Other(e.to_string()))
 }
 
-async fn read_header(recv: &mut RecvStream) -> Result<StreamKind, TransportError> {
-    let mut buf = Vec::new();
-    if !read_frame(recv, &mut buf).await? {
-        return Err(TransportError::StreamClosed);
+async fn write_header(
+    send: SendStream,
+    kind: StreamKind,
+    display: u32,
+) -> Result<MessageWriter<SendStream, StreamHeader>, TransportError> {
+    let mut writer = MessageWriter::<_, StreamHeader>::new(send);
+    writer
+        .send(&StreamHeader {
+            kind: kind as i32,
+            display,
+        })
+        .await?;
+    Ok(writer)
+}
+
+async fn read_header(
+    recv: RecvStream,
+) -> Result<(StreamHeader, MessageReader<RecvStream, StreamHeader>), TransportError> {
+    let mut reader = MessageReader::<_, StreamHeader>::new(recv);
+    match reader.next().await? {
+        Some(header) => Ok((header, reader)),
+        None => Err(TransportError::StreamClosed),
     }
-    StreamKind::decode(&buf)
 }
 
 /// Client side: opens the control stream. The header is sent immediately, so
 /// the server sees the stream at once.
-pub async fn open_control(conn: &Connection) -> Result<(SendStream, RecvStream), TransportError> {
-    let (mut send, recv) = conn.open_bi().await?;
-    send.set_priority(CONTROL_PRIORITY)
-        .map_err(|e| TransportError::Other(e.to_string()))?;
-    write_frame(&mut send, &StreamKind::Control.encode()).await?;
-    Ok((send, recv))
+pub async fn open_control(
+    conn: &Connection,
+) -> Result<(ControlWriter, ControlReader), TransportError> {
+    let (send, recv) = conn.open_bi().await?;
+    set_priority(&send, CONTROL_PRIORITY)?;
+    let writer = write_header(send, StreamKind::Control, 0).await?;
+    Ok((writer.into_typed(), MessageReader::new(recv)))
 }
 
 /// Server side: accepts the client's control stream.
-pub async fn accept_control(conn: &Connection) -> Result<(SendStream, RecvStream), TransportError> {
-    let (send, mut recv) = conn.accept_bi().await?;
-    match read_header(&mut recv).await? {
-        StreamKind::Control => {
-            send.set_priority(CONTROL_PRIORITY)
-                .map_err(|e| TransportError::Other(e.to_string()))?;
-            Ok((send, recv))
-        }
-        other => Err(TransportError::BadStreamHeader(format!(
-            "expected control stream, got {other:?}"
-        ))),
+pub async fn accept_control(
+    conn: &Connection,
+) -> Result<(ControlWriter, ControlReader), TransportError> {
+    let (send, recv) = conn.accept_bi().await?;
+    let (header, reader) = read_header(recv).await?;
+    if header.kind() != StreamKind::Control {
+        return Err(TransportError::BadStreamHeader(format!(
+            "expected a control stream, got {:?}",
+            header.kind()
+        )));
     }
+    set_priority(&send, CONTROL_PRIORITY)?;
+    Ok((MessageWriter::new(send), reader.into_typed()))
 }
 
 /// Server side: opens the video stream for one display.
-pub async fn open_video(conn: &Connection, display: u32) -> Result<SendStream, TransportError> {
-    let mut send = conn.open_uni().await?;
-    send.set_priority(VIDEO_PRIORITY)
-        .map_err(|e| TransportError::Other(e.to_string()))?;
-    write_frame(&mut send, &StreamKind::Video { display }.encode()).await?;
-    Ok(send)
+pub async fn open_video(conn: &Connection, display: u32) -> Result<VideoWriter, TransportError> {
+    let send = conn.open_uni().await?;
+    set_priority(&send, VIDEO_PRIORITY)?;
+    Ok(write_header(send, StreamKind::Video, display)
+        .await?
+        .into_typed())
 }
 
 /// Client side: accepts the next unidirectional stream and reads its header.
-pub async fn accept_uni(conn: &Connection) -> Result<(StreamKind, RecvStream), TransportError> {
-    let mut recv = conn.accept_uni().await?;
-    let kind = read_header(&mut recv).await?;
-    Ok((kind, recv))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn headers_round_trip() {
-        for kind in [
-            StreamKind::Control,
-            StreamKind::Video { display: 0 },
-            StreamKind::Video { display: 7 },
-        ] {
-            assert_eq!(StreamKind::decode(&kind.encode()).unwrap(), kind);
-        }
-    }
-
-    #[test]
-    fn rejects_malformed_headers() {
-        assert!(StreamKind::decode(b"").is_err());
-        assert!(StreamKind::decode(b"XX\x00").is_err());
-        assert!(StreamKind::decode(b"KD\x09").is_err());
-        assert!(StreamKind::decode(b"KD\x01\x00\x00").is_err());
-        assert!(StreamKind::decode(b"KD\x00\x01").is_err());
+pub async fn accept_uni(conn: &Connection) -> Result<IncomingStream, TransportError> {
+    let recv = conn.accept_uni().await?;
+    let (header, reader) = read_header(recv).await?;
+    match header.kind() {
+        StreamKind::Video => Ok(IncomingStream::Video {
+            display: header.display,
+            reader: reader.into_typed(),
+        }),
+        other => Err(TransportError::BadStreamHeader(format!(
+            "unexpected unidirectional stream {other:?}"
+        ))),
     }
 }

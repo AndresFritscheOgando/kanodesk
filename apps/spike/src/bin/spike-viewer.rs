@@ -2,8 +2,11 @@
 //!
 //! ```text
 //! spike-viewer [--connect 127.0.0.1:9000] [--pin FINGERPRINT | --insecure]
-//!              [--seconds N] [--vsync]
+//!              [--seconds N] [--vsync] [--protocol-version N]
 //! ```
+//!
+//! `--protocol-version` advertises only that version in `Hello`, to test the
+//! host's handling of incompatible viewers.
 //!
 //! Threads: the window/render loop (main), the QUIC client (tokio), and a
 //! decoder. Decoded frames go through a one-slot "latest frame" mailbox, so
@@ -20,13 +23,13 @@ use std::time::{Duration, Instant};
 
 use kanodesk_capture::clock;
 use kanodesk_codec::{Decoder, I420Frame, Vp9Decoder};
-use kanodesk_spike::DEFAULT_ADDR;
+use kanodesk_proto::hello;
+use kanodesk_proto::v1::{self, ControlMessage, control_message, video_message};
 use kanodesk_spike::render::SurfaceRenderer;
 use kanodesk_spike::stats::{Samples, ms_between};
-use kanodesk_spike::wire::{Control, VideoHeader, decode_video};
+use kanodesk_spike::{DEFAULT_ADDR, spike_hello};
 use kanodesk_transport::endpoint;
-use kanodesk_transport::framing::{read_frame, write_frame};
-use kanodesk_transport::streams::{self, StreamKind};
+use kanodesk_transport::streams::{self, IncomingStream};
 use kanodesk_transport::tls::{Fingerprint, ServerTrust};
 use tokio::sync::mpsc as tokio_mpsc;
 use winit::application::ApplicationHandler;
@@ -48,6 +51,7 @@ struct Args {
     trust: ServerTrust,
     seconds: Option<u64>,
     vsync: bool,
+    protocol_version: Option<u32>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -55,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
     let mut trust = None;
     let mut seconds = None;
     let mut vsync = false;
+    let mut protocol_version = None;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -67,6 +72,13 @@ fn parse_args() -> Result<Args, String> {
             "--insecure" => trust = Some(ServerTrust::InsecureAcceptAny),
             "--seconds" => seconds = Some(value()?.parse().map_err(|e| format!("--seconds: {e}"))?),
             "--vsync" => vsync = true,
+            "--protocol-version" => {
+                protocol_version = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--protocol-version: {e}"))?,
+                )
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -76,13 +88,33 @@ fn parse_args() -> Result<Args, String> {
         trust,
         seconds,
         vsync,
+        protocol_version,
     })
+}
+
+/// Host-side timing of one frame, from its `VideoFrame`.
+#[derive(Debug, Clone, Copy)]
+struct FrameTimes {
+    seq: u64,
+    capture_us: u64,
+    /// When the host handed the frame to the transport.
+    sent_us: u64,
+}
+
+impl FrameTimes {
+    fn of(frame: &v1::VideoFrame) -> Self {
+        FrameTimes {
+            seq: frame.seq,
+            capture_us: frame.capture_us,
+            sent_us: frame.capture_us + frame.host_delay_us as u64,
+        }
+    }
 }
 
 /// A decoded frame waiting to be shown.
 struct Decoded {
     frame: I420Frame,
-    header: VideoHeader,
+    times: FrameTimes,
     received_us: u64,
     decoded_us: u64,
 }
@@ -129,11 +161,12 @@ fn main() {
     };
     let proxy = event_loop.create_proxy();
     let mailbox = Arc::new(Mailbox::default());
-    let (control_tx, control_rx) = tokio_mpsc::unbounded_channel::<Control>();
+    let (control_tx, control_rx) = tokio_mpsc::unbounded_channel::<ControlMessage>();
 
     let (shutdown, network_thread) = spawn_network(
         args.addr,
         args.trust,
+        args.protocol_version,
         mailbox.clone(),
         proxy.clone(),
         control_tx,
@@ -164,10 +197,11 @@ fn main() {
 fn spawn_network(
     addr: SocketAddr,
     trust: ServerTrust,
+    protocol_version: Option<u32>,
     mailbox: Arc<Mailbox>,
     proxy: EventLoopProxy<UserEvent>,
-    control_tx: tokio_mpsc::UnboundedSender<Control>,
-    control_rx: tokio_mpsc::UnboundedReceiver<Control>,
+    control_tx: tokio_mpsc::UnboundedSender<ControlMessage>,
+    control_rx: tokio_mpsc::UnboundedReceiver<ControlMessage>,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
     std::thread::JoinHandle<()>,
@@ -191,6 +225,7 @@ fn spawn_network(
             let session = network(
                 &client,
                 addr,
+                protocol_version,
                 mailbox,
                 proxy.clone(),
                 control_tx,
@@ -215,42 +250,92 @@ fn spawn_network(
 async fn network(
     client: &kanodesk_transport::Endpoint,
     addr: SocketAddr,
+    protocol_version: Option<u32>,
     mailbox: Arc<Mailbox>,
     proxy: EventLoopProxy<UserEvent>,
-    control_tx: tokio_mpsc::UnboundedSender<Control>,
-    mut control_rx: tokio_mpsc::UnboundedReceiver<Control>,
+    control_tx: tokio_mpsc::UnboundedSender<ControlMessage>,
+    mut control_rx: tokio_mpsc::UnboundedReceiver<ControlMessage>,
 ) -> Result<(), BoxError> {
     let conn = endpoint::connect(client, addr).await?;
     println!("connected to {addr}");
 
-    let (mut control_send, _control_recv) = streams::open_control(&conn).await?;
-    let (kind, mut video) = streams::accept_uni(&conn).await?;
-    let StreamKind::Video { display } = kind else {
-        return Err(format!("expected a video stream, got {kind:?}").into());
+    let (mut control_send, mut control_recv) = streams::open_control(&conn).await?;
+
+    // Hello exchange and version negotiation (kanodesk_proto::hello).
+    let mut ours = spike_hello();
+    if let Some(v) = protocol_version {
+        ours.version = v;
+        ours.min_version = v;
+    }
+    control_send.send(&ours.clone().into()).await?;
+    let theirs = match control_recv.next().await? {
+        Some(ControlMessage {
+            msg: Some(control_message::Msg::Hello(h)),
+        }) => h,
+        other => return Err(format!("expected Hello from host, got {other:?}").into()),
     };
-    // Ask for a keyframe straight away, then forward the decoder's requests.
-    control_tx.send(Control::RequestKeyframe { display })?;
+    let negotiated = match hello::negotiate(&ours, &theirs) {
+        Ok(n) => n,
+        Err(e) => {
+            // The host sends a Close with its view of the problem; show it.
+            if let Ok(Some(ControlMessage {
+                msg: Some(control_message::Msg::Close(c)),
+            })) = control_recv.next().await
+            {
+                eprintln!("host refused: {:?} {}", c.reason(), c.detail);
+            }
+            return Err(e.into());
+        }
+    };
+    println!(
+        "host agent {:?}: protocol v{}, capabilities {:?}",
+        theirs.agent, negotiated.version, negotiated.capabilities
+    );
+
+    // Forward the decoder's control messages; report a Close from the host.
     tokio::spawn(async move {
         while let Some(msg) = control_rx.recv().await {
-            if write_frame(&mut control_send, &msg.encode()).await.is_err() {
+            if control_send.send(&msg).await.is_err() {
                 break;
             }
         }
     });
+    tokio::spawn(async move {
+        while let Ok(Some(msg)) = control_recv.next().await {
+            if let Some(control_message::Msg::Close(c)) = msg.msg {
+                eprintln!("host closed the session: {:?} {}", c.reason(), c.detail);
+            }
+        }
+    });
 
-    let (frames_tx, frames_rx) = std_mpsc::channel::<(Vec<u8>, u64)>();
+    let IncomingStream::Video {
+        display,
+        mut reader,
+    } = streams::accept_uni(&conn).await?;
+    // Ask for a keyframe straight away.
+    control_tx.send(v1::KeyframeRequest { display }.into())?;
+
+    let (frames_tx, frames_rx) = std_mpsc::channel::<(v1::VideoFrame, u64)>();
     std::thread::Builder::new()
         .name("decoder".into())
         .spawn(move || decode_loop(display, frames_rx, mailbox, proxy, control_tx))?;
 
-    let mut buf = Vec::new();
-    while read_frame(&mut video, &mut buf).await? {
+    while let Some(msg) = reader.next().await? {
         let received_us = clock::now_us();
-        if frames_tx
-            .send((std::mem::take(&mut buf), received_us))
-            .is_err()
-        {
-            break;
+        match msg.msg {
+            Some(video_message::Msg::StreamStart(start)) => println!(
+                "stream: display {} {:?} {}x{}",
+                start.display,
+                start.codec(),
+                start.width,
+                start.height
+            ),
+            Some(video_message::Msg::Frame(frame)) => {
+                if frames_tx.send((frame, received_us)).is_err() {
+                    break;
+                }
+            }
+            None => {}
         }
     }
     Ok(())
@@ -260,10 +345,10 @@ async fn network(
 /// asks the host for one.
 fn decode_loop(
     display: u32,
-    frames: std_mpsc::Receiver<(Vec<u8>, u64)>,
+    frames: std_mpsc::Receiver<(v1::VideoFrame, u64)>,
     mailbox: Arc<Mailbox>,
     proxy: EventLoopProxy<UserEvent>,
-    control: tokio_mpsc::UnboundedSender<Control>,
+    control: tokio_mpsc::UnboundedSender<ControlMessage>,
 ) {
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get().min(4)) as u32;
     let mut decoder = match Vp9Decoder::new(threads) {
@@ -279,27 +364,20 @@ fn decode_loop(
     let request_key = |last: &mut Option<Instant>| {
         if last.is_none_or(|t| t.elapsed() >= KEYFRAME_RETRY) {
             *last = Some(Instant::now());
-            let _ = control.send(Control::RequestKeyframe { display });
+            let _ = control.send(v1::KeyframeRequest { display }.into());
         }
     };
 
     for (msg, received_us) in frames {
-        let (header, data) = match decode_video(&msg) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("frame: {e}");
-                continue;
-            }
-        };
-        if waiting_for_key && !header.key {
+        if waiting_for_key && !msg.key {
             continue;
         }
-        match decoder.decode(data) {
+        match decoder.decode(&msg.data) {
             Ok(Some(frame)) => {
                 waiting_for_key = false;
                 mailbox.put(Decoded {
                     frame: frame.clone(),
-                    header,
+                    times: FrameTimes::of(&msg),
                     received_us,
                     decoded_us: clock::now_us(),
                 });
@@ -311,7 +389,7 @@ fn decode_loop(
             Err(e) => {
                 eprintln!(
                     "decode error on frame {}: {e}; requesting keyframe",
-                    header.frame_no
+                    msg.seq
                 );
                 waiting_for_key = true;
                 request_key(&mut last_request);
@@ -334,11 +412,11 @@ struct Timings {
 impl Timings {
     fn record(&mut self, d: &Decoded, presented_us: u64) {
         self.latency
-            .push(ms_between(d.header.capture_us, presented_us));
+            .push(ms_between(d.times.capture_us, presented_us));
         self.host
-            .push(ms_between(d.header.capture_us, d.header.encoded_us));
+            .push(ms_between(d.times.capture_us, d.times.sent_us));
         self.network
-            .push(ms_between(d.header.encoded_us, d.received_us));
+            .push(ms_between(d.times.sent_us, d.received_us));
         self.decode.push(ms_between(d.received_us, d.decoded_us));
         self.render.push(ms_between(d.decoded_us, presented_us));
         self.frames += 1;
@@ -410,7 +488,7 @@ impl App {
         let (fps, avg, p95) = self.shown;
         self.overlay = format!(
             "FRAME {}  LAT {avg:.1} MS  P95 {p95:.1}  FPS {fps:.1}  {}X{}",
-            decoded.header.frame_no, self.video_size.0, self.video_size.1
+            decoded.times.seq, self.video_size.0, self.video_size.1
         );
         if !renderer.render(&self.overlay) {
             return;

@@ -9,8 +9,9 @@
 //!               control stream (QUIC bidi) → keyframe requests
 //! ```
 //!
-//! The wire format in [`wire`] is a throwaway: prompt 4 replaces it with
-//! prost messages in `kanodesk-proto`. Latency is measured from the DXGI
+//! Messages are `kanodesk-proto` types: the viewer and host exchange `Hello`
+//! on the control stream ([`spike_hello`]), then the host sends `StreamStart`
+//! and `VideoFrame`s. Latency is measured from the DXGI
 //! present time of the captured image to the viewer's `present()` call; both
 //! use the system-wide QPC clock, so host and viewer must run on one machine.
 //!
@@ -23,13 +24,26 @@
 pub mod overlay;
 pub mod render;
 pub mod stats;
-pub mod wire;
+
+use kanodesk_proto::hello;
+use kanodesk_proto::v1::{Capability, Hello};
 
 /// Spec documents, relative to the workspace root, that describe this crate's behaviour.
 pub const SPEC_DOCS: &[&str] = &["docs/16-clone-blueprint.md", "docs/06-video-pipeline.md"];
 
 /// Default host address.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:9000";
+
+/// Capabilities the spike host and viewer both announce.
+pub const SPIKE_CAPABILITIES: &[Capability] = &[Capability::VideoVp9, Capability::KeyframeRequest];
+
+/// The `Hello` both spike binaries send.
+pub fn spike_hello() -> Hello {
+    hello::hello(
+        SPIKE_CAPABILITIES,
+        concat!("kanodesk-spike/", env!("CARGO_PKG_VERSION")),
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -42,6 +56,13 @@ mod tests {
         for doc in SPEC_DOCS {
             assert!(root.join(doc).is_file(), "missing spec doc {doc}");
         }
+    }
+
+    #[test]
+    fn host_and_viewer_hellos_negotiate_vp9() {
+        let n = hello::negotiate(&spike_hello(), &spike_hello()).unwrap();
+        assert!(n.has(Capability::VideoVp9));
+        assert!(n.has(Capability::KeyframeRequest));
     }
 
     #[test]

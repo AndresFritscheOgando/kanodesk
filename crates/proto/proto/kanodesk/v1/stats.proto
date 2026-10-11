@@ -1,0 +1,19 @@
+// Receiver statistics (16 §8 "Stats"), viewer to host, roughly once a second.
+// Input to rate control (16 §4 row 3.2).
+syntax = "proto3";
+
+package kanodesk.v1;
+
+message ReceiverReport {
+  uint32 display = 1;
+  // Frames lost or dropped since the previous report.
+  uint32 lost = 2;
+  // Inter-arrival jitter, in milliseconds.
+  float jitter_ms = 3;
+  // Average decode time, in milliseconds.
+  float decode_ms = 4;
+  // Frames shown per second.
+  float rendered_fps = 5;
+  // Highest VideoFrame.seq received.
+  uint64 last_seq = 6;
+}
