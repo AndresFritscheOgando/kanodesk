@@ -1,0 +1,17 @@
+[package]
+name = "kanodesk-relay"
+description = "KanoDesk relay server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kanodesk-relay"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

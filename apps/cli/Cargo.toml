@@ -1,0 +1,17 @@
+[package]
+name = "kanodesk-cli"
+description = "KanoDesk provisioning CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kanodesk-cli"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+# Build output
+/target/
+**/*.rs.bk
+
+# Windows debug symbols and dumps
+*.pdb
+*.dmp
+
+# Coverage / profiling
+*.profraw
+*.profdata
+lcov.info
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local config, logs and secrets
+*.log
+.env
+/local/

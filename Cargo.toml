@@ -1,0 +1,140 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/proto",
+    "crates/crypto",
+    "crates/transport",
+    "crates/rendezvous",
+    "crates/capture",
+    "crates/codec",
+    "crates/input",
+    "crates/host",
+    "crates/client",
+    "crates/config",
+    "crates/platform",
+    "apps/desktop",
+    "apps/service",
+    "apps/cli",
+    "server/idserver",
+    "server/relay",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+# Crate choices from docs/16-clone-blueprint.md §3. An entry here costs nothing
+# until a member crate opts in with `foo.workspace = true`.
+[workspace.dependencies]
+# Internal crates
+kanodesk-proto = { path = "crates/proto" }
+kanodesk-crypto = { path = "crates/crypto" }
+kanodesk-transport = { path = "crates/transport" }
+kanodesk-rendezvous = { path = "crates/rendezvous" }
+kanodesk-capture = { path = "crates/capture" }
+kanodesk-codec = { path = "crates/codec" }
+kanodesk-input = { path = "crates/input" }
+kanodesk-host = { path = "crates/host" }
+kanodesk-client = { path = "crates/client" }
+kanodesk-config = { path = "crates/config" }
+kanodesk-platform = { path = "crates/platform" }
+
+# Async
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = "0.7"
+bytes = "1.12"
+
+# Protobuf
+prost = "0.14"
+prost-build = "0.14"
+
+# Transport and NAT traversal
+quinn = "0.11"
+rustls = "0.23"
+rcgen = "0.14"
+tokio-tungstenite = "0.30"
+socket2 = "0.6"
+stun-rs = "0.1"
+webrtc-ice = "0.17"
+
+# Crypto
+ed25519-dalek = "3.0"
+x25519-dalek = "3.0"
+snow = "0.10"
+spake2 = "0.4"
+chacha20poly1305 = "0.11"
+blake3 = "1.8"
+zeroize = "1.9"
+rand = "0.10"
+
+# Secrets at rest / Windows
+keyring = "4.2"
+windows = "0.62"
+windows-service = "0.8"
+
+# Capture, colour conversion, codecs, rendering
+windows-capture = "2.0"
+yuvutils-rs = "0.8"
+env-libvpx-sys = "5.1"
+vpx-encode = "0.6"
+openh264 = "0.9"
+dav1d = "0.11"
+wgpu = "30.0"
+winit = "0.30"
+
+# Input
+enigo = "0.6"
+
+# Audio (phase 2)
+cpal = "0.18"
+opus = "0.4"
+audiopus = "0.2"
+rubato = "5.0"
+ringbuf = "0.5"
+
+# Clipboard (phase 2)
+arboard = "3.6"
+clipboard-master = "4.0"
+
+# Terminal (phase 3)
+portable-pty = "0.9"
+alacritty_terminal = "0.26"
+vt100 = "0.16"
+
+# Config and IPC
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+directories = "6.0"
+interprocess = "2.4"
+postcard = { version = "1.1", features = ["use-std"] }
+
+# HTTP and server API
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+axum = "0.8"
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
+
+# UI (one of these gets picked in phase 1, see PROGRESS.md)
+slint = "1.18"
+eframe = "0.36"
+
+# Logging, errors, CLI
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+thiserror = "2.0"
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+
+# Testing
+proptest = "1.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

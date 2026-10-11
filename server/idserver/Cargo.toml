@@ -1,0 +1,17 @@
+[package]
+name = "kanodesk-idserver"
+description = "KanoDesk ID/rendezvous server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kanodesk-idserver"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
