@@ -26,6 +26,7 @@ Status: early scaffold. See [PROGRESS.md](PROGRESS.md) for what works and what's
 | `apps/desktop` | Desktop UI (`kanodesk`) |
 | `apps/service` | Windows service wrapper (`kanodesk-service`) |
 | `apps/cli` | Provisioning CLI (`kanodesk-cli`) |
+| `apps/spike` | Phase 0 spike: `spike-host` and `spike-viewer` |
 | `server/idserver` | ID/rendezvous server (`kanodesk-idserver`) |
 | `server/relay` | Relay server (`kanodesk-relay`) |
 
@@ -69,6 +70,22 @@ Tests that need a real interactive desktop (DXGI capture) are `#[ignore]`d becau
 ```bash
 cargo test -p kanodesk-capture -- --ignored
 ```
+
+### Phase 0 spike: stream your screen
+
+Two binaries in `apps/spike`. Start the host; it prints a certificate fingerprint and the exact viewer command:
+
+```bash
+cargo run --release -p kanodesk-spike --bin spike-host -- --listen 127.0.0.1:9000 --fps 30
+```
+
+Then, in a second terminal, run the viewer with the fingerprint the host printed:
+
+```bash
+cargo run --release -p kanodesk-spike --bin spike-viewer -- --connect 127.0.0.1:9000 --pin <fingerprint>
+```
+
+The viewer window shows the host's primary display with a frame counter and latency overlay, and prints per-second stats. Add `--seconds N` to stop after N seconds with a summary, or `--vsync` for Fifo presentation. The latency figure is only meaningful when both run on the same machine. The spike has no real authentication; keep it on localhost or a trusted LAN.
 
 ### Capture benchmark
 

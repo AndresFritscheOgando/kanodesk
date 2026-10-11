@@ -4,6 +4,20 @@ Roadmap: [docs/16-clone-blueprint.md](docs/16-clone-blueprint.md) §6. Build pro
 
 ## Done
 
+- **2026-10-11: phase 0 spike, part B: send, decode, render** (prompt 3). **Phase 0 exit criterion met.**
+  - `crates/transport`: quinn wrapper. TLS 1.3 (rustls, ring provider) on a per-run self-signed certificate; the client pins it by BLAKE3 fingerprint (`tls.rs`; `--insecure` skips the check for local tests). `framing.rs`: `u32` big-endian length prefix, 16 MiB cap, clean-EOF vs truncation. `streams.rs`: stream layout from 16 §4 — the client opens one **control** bidi stream (priority 10), the server opens one **video** uni stream per display (priority 0); each starts with a `KD` + kind header. `endpoint.rs`: server/client endpoints, keep-alive 5 s, idle timeout 30 s, 8 MiB stream / 32 MiB connection windows, `close`/`shutdown` helpers so peers notice disconnects at once.
+  - `apps/spike` (`kanodesk-spike`): `spike-host` (capture → I420 → VP9 → video stream, paced at `--fps`; frames sent only when the desktop changed or a keyframe was requested) and `spike-viewer` (QUIC client thread → decoder thread → one-slot "latest frame" mailbox → winit + wgpu window). Y/U/V uploaded as three `R8Unorm` textures; `video.wgsl` converts BT.601 limited range to RGB, letterboxes, and draws the overlay (frame number, latency avg/p95, fps, size) with a built-in 3×5 bitmap font. The viewer asks for a keyframe on connect and after any decode error (then drops frames until a keyframe; requests rate-limited to one per 250 ms). Spike wire format (`wire.rs`) is a throwaway until prompt 4.
+  - Tests: 13 in `kanodesk-transport` (framing, headers, fingerprints, pin rejection, loopback control+video streams, prompt close) and 15 in `kanodesk-spike` (wire, stats, font, letterbox, uniform layout, WGSL validated with naga incl. the uniform size), plus an `#[ignore]`d GPU test that renders offscreen and checks BT.601 red, the letterbox bar and overlay pixels (passes locally).
+  - **Measured on this machine** (same hardware as part A; both binaries in release on one machine over loopback; 1920×1080 primary display; VP9 3000 kbps, speed 6). Latency = viewer `present()` − DXGI present time of the captured image, both on the QPC clock. The viewer's own scan-out and display lag are **not** included (add up to one 60 Hz refresh plus panel lag for true glass-to-glass).
+
+    | Run | fps | Latency avg / p50 / p95 / p99 / max | Host (capture→encoded) | Network | Decode | Render | Bitrate |
+    |---|---|---|---|---|---|---|---|
+    | Mailbox present, 20 s | **30.0** | **11.9** / 12.2 / 13.2 / 13.6 / 14.7 ms | 8.8 ms | 0.3 ms | 1.9 ms | 1.0 ms | ~2.9 Mbit/s |
+    | Mailbox present, 20 s (earlier run) | 30.0 | 15.6 / 15.7 / 17.0 / 17.9 / 19.1 ms | 12.5 ms | 0.3 ms | 1.8 ms | 1.0 ms | ~3.0 Mbit/s |
+    | Fifo (vsync), 10 s | 30.0 | 14.0 / 14.1 / 15.8 / 16.6 / 17.6 ms | 11.0 ms | 0.3 ms | 2.1 ms | 0.7 ms | — |
+    | Second viewer taking over, 5 s | 30.2 | 20.1 / 20.4 / 21.6 / 21.9 / 22.6 ms | 17.2 ms | 0.3 ms | 1.8 ms | 0.9 ms | — |
+
+    Host encode time was 2.9–4.0 ms avg (p95 ≤ 4.6 ms). Most of "host" is the wait between the desktop update and the next 33 ms capture tick, which is why it varies between runs (8.8–17.2 ms). **Exit criterion met on the numbers: 1080p30 at well under 100 ms.** Verified by the agent: every run presented 1920×1080 frames at 30 fps, and the offscreen GPU test confirms the shader's colour conversion, letterbox and overlay. Not verified by the agent: how the window looked on screen (it had no screenshot access); a person should glance at it once.
 - **2026-10-11: phase 0 spike, part A: capture and encode** (prompt 2).
   - `crates/capture`: `Capturer` trait (`displays()`, `open()`, `next_frame(timeout)` → tightly packed BGRA `Frame` with `timestamp_us` and a `dirty` flag; `Ok(None)` = no change within the timeout). DXGI Desktop Duplication backend (`dxgi.rs`): device created on the output's own adapter, GPU copy to a staging texture, row copy that strips the pitch. `ACCESS_LOST`, device removed/reset → rebuild on the next call. `E_ACCESSDENIED`, `NOT_CURRENTLY_AVAILABLE`, `SESSION_DISCONNECTED` → wait out the timeout and retry. Timeout → `Ok(None)`. Pointer-only updates → previous image with `dirty = false`. Timestamps are QPC-based µs (`clock.rs`), comparable across processes on one machine.
   - `crates/codec`: `Encoder`/`Decoder` traits, `I420Frame`, `EncoderConfig`. BGRA⇄I420 via `yuvutils-rs` (BT.601 limited range). libvpx VP9 backend (`vpx.rs`), with realtime settings from 06 §10: one pass, CBR, `lag_in_frames 0`, error resilient, `cpu-used 6`, screen-content tuning, row-MT, tile columns by width, cyclic-refresh AQ, keyframes at start and on request. Decoder copies libvpx output into an `I420Frame`.
@@ -27,7 +41,8 @@ Roadmap: [docs/16-clone-blueprint.md](docs/16-clone-blueprint.md) §6. Build pro
 
 ## Next
 
-1. **Phase 0 spike, part B** (prompt 3): quinn wrapper in `crates/transport`, plus `spike-host` and `spike-viewer` binaries (winit + wgpu, YUV→RGB in WGSL using BT.601 limited range to match `kanodesk_codec::convert`). Target: 1080p30 under 100 ms.
+1. **Protocol crate** (prompt 4): own `.proto` files for the 16 §8 MVP message set with prost, `Hello` version negotiation, and the QUIC framing codec; replace the spike's hand-rolled `wire.rs`.
+2. Re-measure the spike across two machines on a LAN (needs a latency method that does not rely on a shared clock, e.g. an on-screen timestamp captured remotely, 16 §7).
 
 ## Known issues
 
@@ -38,7 +53,14 @@ Roadmap: [docs/16-clone-blueprint.md](docs/16-clone-blueprint.md) §6. Build pro
 - No GDI fallback yet for where DXGI fails (some RDP sessions, Windows 7). The secure desktop needs the service/SYSTEM setup from phase 1 (14).
 - Dirty rectangles are not used yet; every changed frame is copied and encoded in full (06 §10 lists dirty-rect skipping as the next optimisation).
 - `next_frame` returns `Ok(None)` forever if duplication never becomes possible again (for example a display that stays on the secure desktop); a caller-side timeout and a GDI fallback are needed later.
-- No internal dependencies are wired between crates yet apart from the `capture_bench` dev-dependency.
+- **Spike security is placeholder only**: a self-signed certificate pinned by fingerprint, no user authentication, no access control. Anyone who can reach the port and knows the fingerprint gets the screen, and `--insecure` disables even that. Do not expose `spike-host` beyond localhost/LAN tests. Phase 1 replaces it (Noise IK + SPAKE2, 16 §5).
+- Video frames are sent **reliably** on the video stream. 16 §4 wants unreliable delivery with keyframe recovery; on a lossy link, reliable delivery adds head-of-line delay. Revisit with QoS.
+- The spike latency number relies on both processes reading the same QPC clock, so it only works on one machine, and it stops at the viewer's `present()` call (scan-out not included).
+- `spike-host` serves one viewer at a time; a new viewer replaces the current one. DXGI allows one duplication per output per process (a second `DuplicateOutput` fails with `E_INVALIDARG`), so several viewers need one shared capture per display fanned out to per-viewer encoders.
+- The viewer's mailbox skips 8–14 frames per session, all during start-up while the window and swapchain are created; none in steady state.
+- The host logs a viewer's normal disconnect as "ended: I/O: connection lost"; the wording should distinguish a clean close.
+- Capture is paced on a fixed 33 ms tick, which adds 0–33 ms of waiting (the "host" stage). Capturing on the desktop's update instead of a tick would cut average latency further.
+- No internal dependencies are wired between the phase 1 crates yet; only `kanodesk-spike` and the `capture_bench` example use the others.
 - The CI workflow has not run yet: there is no GitHub remote. Its first run builds libvpx (~3 min); later runs hit the cache.
 
 ## Decisions
@@ -61,3 +83,11 @@ Roadmap: [docs/16-clone-blueprint.md](docs/16-clone-blueprint.md) §6. Build pro
 | 2026-10-11 | Frames are tightly packed copies owned by the capturer and lent to the caller | One CPU copy (~1 ms at 1080p) keeps the API simple; the GPU/VRAM zero-copy path comes with HW encode in phase 3 |
 | 2026-10-11 | Capture timestamps are QPC microseconds (DXGI `LastPresentTime`) | System-wide clock, so the part B latency overlay can compare host and viewer on one machine |
 | 2026-10-11 | DXGI hardware tests are `#[ignore]`d | GitHub runners have no interactive desktop; run locally with `-- --ignored` |
+| 2026-10-11 | quinn and rustls use the **ring** provider, with default features off (no aws-lc-rs, no platform verifier) | aws-lc-sys needs CMake/NASM on Windows; ring builds with MSVC alone |
+| 2026-10-11 | Spike TLS: per-run self-signed cert pinned by BLAKE3 fingerprint, not "accept any" | Barely more code than skipping verification, and it keeps the habit of authenticating the host; throwaway until 16 §5 |
+| 2026-10-11 | Spike binaries live in their own crate, `apps/spike` (`kanodesk-spike`), with the shared wire/stats/render code in its library | Keeps throwaway code out of the real crates while still unit-testable |
+| 2026-10-11 | Viewer threading: tokio network thread → decoder thread → one-slot mailbox → UI thread renders on arrival | The UI only ever shows the newest frame, so a slow frame never builds a queue (16 §4 row 3.6) |
+| 2026-10-11 | Viewer present mode: Mailbox, else Immediate, else Fifo; `desired_maximum_frame_latency = 1`; `--vsync` forces Fifo | Lowest latency without tearing where available; measured Fifo costs ~2 ms more here |
+| 2026-10-11 | Non-sRGB swapchain format (`Bgra8Unorm`) | The shader already outputs display-referred values; an sRGB target would gamma-encode them twice |
+| 2026-10-11 | Overlay text drawn by the fragment shader from a 3×5 bitmap font in the uniform buffer | No font/text crates or version coupling with wgpu for a spike |
+| 2026-10-11 | Host serves one viewer at a time; new viewer replaces the old | DXGI's one-duplication-per-output-per-process limit; fan-out comes with the real host engine |

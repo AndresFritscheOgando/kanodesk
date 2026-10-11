@@ -15,6 +15,7 @@ members = [
     "apps/desktop",
     "apps/service",
     "apps/cli",
+    "apps/spike",
     "server/idserver",
     "server/relay",
 ]
@@ -56,8 +57,8 @@ prost = "0.14"
 prost-build = "0.14"
 
 # Transport and NAT traversal
-quinn = "0.11"
-rustls = "0.23"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 rcgen = "0.14"
 tokio-tungstenite = "0.30"
 socket2 = "0.6"
@@ -88,6 +89,7 @@ openh264 = "0.9"
 dav1d = "0.11"
 wgpu = "30.0"
 winit = "0.30"
+pollster = "1.0"
 
 # Input
 enigo = "0.6"

@@ -1,0 +1,32 @@
+[package]
+name = "kanodesk-spike"
+description = "KanoDesk phase 0 spike: QUIC screen streaming host and viewer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "spike-host"
+path = "src/bin/spike-host.rs"
+
+[[bin]]
+name = "spike-viewer"
+path = "src/bin/spike-viewer.rs"
+
+[dependencies]
+kanodesk-capture.workspace = true
+kanodesk-codec.workspace = true
+kanodesk-transport.workspace = true
+pollster.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+[dev-dependencies]
+naga = { version = "30.0", features = ["wgsl-in"] }
+
+[lints]
+workspace = true
