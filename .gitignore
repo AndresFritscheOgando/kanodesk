@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# vcpkg manifest-mode install tree
+/vcpkg_installed/
+
 # Windows debug symbols and dumps
 *.pdb
 *.dmp

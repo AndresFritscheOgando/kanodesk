@@ -22,6 +22,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Native libraries (libvpx) from vcpkg.json, cached by manifest hash.
+      # Uses a fresh vcpkg clone because the runner's copy may predate our baseline.
+      - name: Cache vcpkg libraries
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_installed
+          key: vcpkg-${{ runner.os }}-x64-windows-static-md-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install vcpkg libraries
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg "$env:RUNNER_TEMP\vcpkg"
+          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install --triplet x64-windows-static-md --disable-metrics
+
       - name: cargo fmt
         run: cargo fmt --all -- --check
 

@@ -33,6 +33,19 @@ Status: early scaffold. See [PROGRESS.md](PROGRESS.md) for what works and what's
 
 Windows 10/11 x64 is the first target. The toolchain is pinned to stable by `rust-toolchain.toml`.
 
+Prerequisites:
+
+- Visual Studio Build Tools with the C++ workload (MSVC).
+- [vcpkg](https://github.com/microsoft/vcpkg) for native libraries (currently libvpx). `vcpkg.json` pins the versions; `.cargo/config.toml` points the build at `./vcpkg_installed/`.
+
+Install the native libraries once from the repo root (about 3 minutes the first time):
+
+```bash
+vcpkg install --triplet x64-windows-static-md
+```
+
+Then build:
+
 ```bash
 cargo build --workspace
 ```
@@ -49,6 +62,20 @@ cargo fmt --all -- --check
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Tests that need a real interactive desktop (DXGI capture) are `#[ignore]`d because CI runners have none. Run them locally with:
+
+```bash
+cargo test -p kanodesk-capture -- --ignored
+```
+
+### Capture benchmark
+
+Captures the primary display, converts to I420 and encodes VP9, then prints fps, per-stage times and bytes per frame. Put something moving on screen first. The flags are listed at the top of `crates/codec/examples/capture_bench.rs`.
+
+```bash
+cargo run --release -p kanodesk-codec --example capture_bench -- --seconds 10 --fps 30
 ```
 
 ## Licence

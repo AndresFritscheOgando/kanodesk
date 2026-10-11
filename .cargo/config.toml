@@ -1,0 +1,10 @@
+# Native libraries come from vcpkg in manifest mode (see vcpkg.json and README):
+#   vcpkg install --triplet x64-windows-static-md
+# which installs into ./vcpkg_installed/.
+
+[env]
+# env-libvpx-sys ships pregenerated bindings up to 1.13.0; vcpkg.json pins
+# libvpx 1.13.1, a security-fix release with the same ABI.
+VPX_VERSION = "1.13.0"
+VPX_LIB_DIR = { value = "vcpkg_installed/x64-windows-static-md/lib", relative = true }
+VPX_INCLUDE_DIR = { value = "vcpkg_installed/x64-windows-static-md/include", relative = true }

@@ -8,6 +8,15 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+env-libvpx-sys.workspace = true
+thiserror.workspace = true
+yuvutils-rs.workspace = true
+
+[dev-dependencies]
+kanodesk-capture.workspace = true
+
+[[example]]
+name = "capture_bench"
 
 [lints]
 workspace = true
