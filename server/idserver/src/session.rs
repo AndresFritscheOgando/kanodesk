@@ -13,6 +13,9 @@ use kanodesk_rendezvous::record::{
     verify_register,
 };
 use kanodesk_rendezvous::{DeviceId, unix_now};
+use kanodesk_transport::nat::{is_global_v6, is_private_v4, is_public_v4};
+use kanodesk_transport::peer::canonical;
+use kanodesk_transport::relay::{RelaySecret, TICKET_LIFETIME, issue_ticket};
 use kanodesk_transport::streams::accept_rendezvous;
 use kanodesk_transport::{Connection, endpoint};
 use tokio::sync::mpsc;
@@ -48,6 +51,7 @@ pub struct Shared {
     relays: Mutex<Vec<String>>,
     next_relay: AtomicUsize,
     trusted: Vec<Cidr>,
+    relay_secret: Option<RelaySecret>,
 }
 
 impl Shared {
@@ -58,6 +62,7 @@ impl Shared {
         limits: Limits,
         relays: Vec<String>,
         trusted: Vec<Cidr>,
+        relay_secret: Option<RelaySecret>,
     ) -> Self {
         Shared {
             registry,
@@ -74,6 +79,7 @@ impl Shared {
             relays: Mutex::new(relays),
             next_relay: AtomicUsize::new(0),
             trusted,
+            relay_secret,
         }
     }
 
@@ -191,6 +197,24 @@ struct Session<'a> {
     key: Option<DevicePublicKey>,
     admin: bool,
     conn: Connection,
+    local_addrs: Vec<SocketAddr>,
+    nat: v1::NatType,
+}
+
+/// Most local addresses kept per device.
+const MAX_LOCAL_ADDRS: usize = 8;
+
+/// Local addresses worth giving a peer: public addresses (global IPv6,
+/// public IPv4 such as a UPnP mapping) always, private IPv4 only on the same
+/// network (same public IP). Nothing else is shared.
+fn shareable(addrs: &[SocketAddr], same_network: bool) -> Vec<String> {
+    addrs
+        .iter()
+        .filter(|a| {
+            is_global_v6(a.ip()) || is_public_v4(a.ip()) || (same_network && is_private_v4(a.ip()))
+        })
+        .map(|a| a.to_string())
+        .collect()
 }
 
 impl Session<'_> {
@@ -229,6 +253,9 @@ impl Session<'_> {
             Msg::Lookup(l) => self.lookup(&l.id, now),
             Msg::OnlineQuery(q) => self.online_query(&q.ids),
             Msg::ConnectRequest(c) => self.connect(&c.target_id, now),
+            Msg::NatProbe(_) => Ok(Msg::NatProbeResult(v1::NatProbeResult {
+                observed_addr: self.addr.to_string(),
+            })),
             Msg::Ping(p) => Ok(Msg::Pong(v1::RendezvousPong {
                 timestamp_us: p.timestamp_us,
             })),
@@ -244,6 +271,14 @@ impl Session<'_> {
         &mut self,
         r: v1::Register,
     ) -> Result<Msg, (RendezvousError, Option<Duration>)> {
+        self.local_addrs = r
+            .local_addrs
+            .iter()
+            .filter_map(|a| a.parse::<SocketAddr>().ok())
+            .map(canonical)
+            .take(MAX_LOCAL_ADDRS)
+            .collect();
+        self.nat = r.nat_type();
         let (key, requested) = verify_register(&r, &self.binding).map_err(|p| match p {
             RegisterProblem::BadSignature => (RendezvousError::BadSignature, None),
             RegisterProblem::InvalidId => (RendezvousError::InvalidId, None),
@@ -275,6 +310,8 @@ impl Session<'_> {
                 addr: self.addr,
                 push: self.tx.clone(),
                 conn: self.conn.clone(),
+                local_addrs: self.local_addrs.clone(),
+                nat: self.nat,
             },
         );
         // Current configuration first, so it is known when the reply arrives.
@@ -453,14 +490,26 @@ impl Session<'_> {
             .online(target)
             .ok_or((RendezvousError::Offline, None))?;
         let relay = self.shared.pick_relay();
-        let mut relay_session = vec![0u8; 16];
+        let mut relay_session = [0u8; 16];
         getrandom::fill(&mut relay_session).map_err(|_| (RendezvousError::ServerError, None))?;
+        let relay_ticket = match (&self.shared.relay_secret, relay.is_empty()) {
+            (Some(secret), false) => issue_ticket(
+                &secret.0,
+                &relay_session,
+                unix_now() + TICKET_LIFETIME.as_secs(),
+            ),
+            _ => Vec::new(),
+        };
+        let same_network = self.addr.ip() == host.addr.ip();
         let push = v1::IncomingConnect {
             controller: Some(sign_record(&self.shared.signing, me, &my_key)),
             controller_addr: self.addr.to_string(),
             host_addr: host.addr.to_string(),
             relay: relay.clone(),
-            relay_session: relay_session.clone(),
+            relay_session: relay_session.to_vec(),
+            controller_local_addrs: shareable(&self.local_addrs, same_network),
+            relay_ticket: relay_ticket.clone(),
+            controller_nat: self.nat as i32,
         };
         host.push
             .try_send(reply(0, Msg::IncomingConnect(push)))
@@ -470,14 +519,18 @@ impl Session<'_> {
             host_addr: host.addr.to_string(),
             controller_addr: self.addr.to_string(),
             relay,
-            relay_session,
+            relay_session: relay_session.to_vec(),
+            host_local_addrs: shareable(&host.local_addrs, same_network),
+            relay_ticket,
+            host_nat: host.nat as i32,
         }))
     }
 }
 
 /// Serves one connection until it closes.
 pub async fn serve(conn: Connection, shared: &Shared) {
-    let addr = conn.remote_address();
+    // Dual-stack listeners report IPv4 peers as mapped IPv6; peers want plain IPv4.
+    let addr = canonical(conn.remote_address());
     let Some(_slot) = take_slot(shared, addr.ip()) else {
         endpoint::close(&conn, b"too many connections");
         return;
@@ -519,6 +572,8 @@ pub async fn serve(conn: Connection, shared: &Shared) {
         key: None,
         admin: false,
         conn: conn.clone(),
+        local_addrs: Vec::new(),
+        nat: v1::NatType::Unknown,
     };
     while let Ok(Some(msg)) = reader.next().await {
         let Some(body) = msg.msg else { continue };
@@ -546,4 +601,33 @@ pub async fn serve(conn: Connection, shared: &Shared) {
     drop(session);
     drop(tx);
     let _ = writer_task.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_addresses_are_shared_carefully() {
+        let addrs: Vec<SocketAddr> = [
+            "192.168.1.5:7",
+            "[2001:db8::5]:7",
+            "[fe80::1]:7",
+            "8.8.8.8:7",
+            "127.0.0.1:7",
+        ]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+        // Strangers: public addresses only. Same network: private IPv4 too.
+        // Link-local and loopback never.
+        assert_eq!(
+            shareable(&addrs, false),
+            vec!["[2001:db8::5]:7", "8.8.8.8:7"]
+        );
+        assert_eq!(
+            shareable(&addrs, true),
+            vec!["192.168.1.5:7", "[2001:db8::5]:7", "8.8.8.8:7"]
+        );
+    }
 }

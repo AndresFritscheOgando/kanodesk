@@ -25,10 +25,10 @@ Status: early scaffold. See [PROGRESS.md](PROGRESS.md) for what works and what's
 | `crates/platform` | OS integration (service, sessions, autostart) |
 | `apps/desktop` | Desktop UI (`kanodesk`) |
 | `apps/service` | Windows service wrapper (`kanodesk-service`) |
-| `apps/cli` | Provisioning CLI (`kanodesk-cli`) |
+| `apps/cli` | Provisioning CLI (`kanodesk-cli`); for now the `p2p-host` / `p2p-connect` network diagnostics |
 | `apps/spike` | Phase 0 spike: `spike-host` and `spike-viewer` |
 | `server/idserver` | ID/rendezvous server (`kanodesk-idserver`): registration, lookups, online status, connect broker |
-| `server/relay` | Relay server (`kanodesk-relay`) |
+| `server/relay` | Relay server (`kanodesk-relay`): blind UDP relay for QUIC with tickets and bandwidth limits |
 
 ## Build
 
@@ -91,6 +91,62 @@ cargo run --release -p kanodesk-idserver -- list --data-dir ./idserver-data
 
 Clients use `kanodesk_rendezvous::RendezvousClient` with the server address and that key. The end-to-end tests in `server/idserver/tests/rendezvous.rs` show the full flow.
 
+### Relay server
+
+`server/relay` forwards whole QUIC packets between two devices when no direct path works. It never sees keys or content (TLS and Noise stay end to end), only serves sessions the ID server issued (tickets signed with a secret both share), and limits each session's bandwidth.
+
+```bash
+cargo run --release -p kanodesk-relay -- new-secret relay.secret
+```
+
+```bash
+cargo run --release -p kanodesk-relay -- --listen 0.0.0.0:21117 --secret-file relay.secret --port-range 30000-30099
+```
+
+Give the ID server the same file and the relay's public address: `--relay-secret-file relay.secret --relay PUBLIC_IP:21117`. The ID server also answers NAT probes on its port minus one (21115 by default).
+
+### Testing connections between two networks
+
+You need one machine reachable from both networks for the servers (a small VPS, or a router with port forwarding), and two machines on different networks. Neither server needs libvpx, so they build on Linux too.
+
+1. **Server machine.** Open UDP 21115, 21116, 21117 and 30000–30099 in the firewall (and forward them if behind a router). Then:
+
+   ```bash
+   cargo build --release -p kanodesk-idserver -p kanodesk-relay
+   ```
+
+   ```bash
+   ./target/release/kanodesk-relay new-secret relay.secret
+   ```
+
+   ```bash
+   ./target/release/kanodesk-relay --listen 0.0.0.0:21117 --secret-file relay.secret --port-range 30000-30099
+   ```
+
+   In a second terminal (replace `PUBLIC_IP` with the address the two machines will use to reach this server):
+
+   ```bash
+   ./target/release/kanodesk-idserver --listen 0.0.0.0:21116 --data-dir ./ids --relay PUBLIC_IP:21117 --relay-secret-file relay.secret
+   ```
+
+   Note the `server key` it prints.
+
+2. **Machine A (host).** Build `cargo build --release -p kanodesk-cli` and run (allow the firewall prompt):
+
+   ```bash
+   ./target/release/kanodesk-cli p2p-host --server PUBLIC_IP:21116 --server-key SERVER_KEY
+   ```
+
+   It prints its device ID, NAT type and a **temporary password**, tries a UPnP port mapping on the router (`--no-upnp` to skip; removed again on Ctrl+C), and waits. Every connection must log in with that password before anything is echoed. Each temporary password works for one login only (and changes after repeated wrong guesses); the host prints the new one. Failed logins are rate-limited per source IP and remembered across restarts; `--reset-login-limits` forgets them.
+
+3. **Machine B (controller), on another network:**
+
+   ```bash
+   ./target/release/kanodesk-cli p2p-connect HOST_ID --server PUBLIC_IP:21116 --server-key SERVER_KEY
+   ```
+
+   It asks for the host's password (hidden input; or pass `--password PASSWORD`). After connecting it checks that it reached the device whose key the ID server signed, then logs in. It prints both NAT types, which path won (`Lan`, `Ipv6`, `Direct` or `Relay`), the connect time, round-trip times and throughput. Run it again with `--relay-only` to test the relay, and with `--no-relay` to see whether a direct punch works on its own. Add `RUST_LOG=debug` for more detail.
+
 ### Fuzzing the protocol decoder
 
 `crates/proto/fuzz` is a cargo-fuzz project (its own workspace, nightly only). The same check also runs on stable as a proptest. One-time setup:
@@ -111,19 +167,21 @@ cargo +nightly fuzz run decode_frames -- -max_total_time=60
 
 ### Phase 0 spike: stream your screen
 
-Two binaries in `apps/spike`. Start the host; it prints a certificate fingerprint and the exact viewer command:
+Two binaries in `apps/spike`. Start the host; it prints its device key, a temporary password and the exact viewer command:
 
 ```bash
 cargo run --release -p kanodesk-spike --bin spike-host -- --listen 127.0.0.1:9000 --fps 30
 ```
 
-Then, in a second terminal, run the viewer with the fingerprint the host printed:
+Then, in a second terminal, run the viewer with the device key the host printed, and type the password when asked (input is hidden; or pass `--password`):
 
 ```bash
-cargo run --release -p kanodesk-spike --bin spike-viewer -- --connect 127.0.0.1:9000 --pin <fingerprint>
+cargo run --release -p kanodesk-spike --bin spike-viewer -- --connect 127.0.0.1:9000 --host-key <device key>
 ```
 
-The viewer window shows the host's primary display with a frame counter and latency overlay, and prints per-second stats. Add `--seconds N` to stop after N seconds with a summary, or `--vsync` for Fifo presentation. The latency figure is only meaningful when both run on the same machine. The spike has no real authentication; keep it on localhost or a trusted LAN.
+The viewer logs in before any video flows: a Noise handshake bound to the TLS connection proves it reached the device with that key, then SPAKE2 proves it knows the password without sending it. A wrong password gets no video; repeated failures are rate-limited (remembered across host restarts; `spike-host --reset-login-limits` forgets them) and change the temporary password. Each temporary password works for one login; the host prints the next one. `spike-host --set-permanent PASSWORD` saves a permanent password (at least 8 characters, DPAPI-protected) that also works; `--clear-permanent` removes it. Both binaries keep their device keys DPAPI-protected under `%LOCALAPPDATA%\KanoDesk\` (`--data-dir` to change). `--pin <fingerprint>` additionally pins the host's TLS certificate.
+
+The viewer window shows the host's primary display with a frame counter and latency overlay, and prints per-second stats. Add `--seconds N` to stop after N seconds with a summary, or `--vsync` for Fifo presentation. The latency figure is only meaningful when both run on the same machine. The spike is still a test tool (one viewer at a time, no access control beyond the password); keep it on localhost or a trusted LAN.
 
 ### Capture benchmark
 

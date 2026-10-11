@@ -8,6 +8,14 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+kanodesk-proto.workspace = true
+kanodesk-rendezvous.workspace = true
+kanodesk-transport.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+kanodesk-crypto.workspace = true
 
 [lints]
 workspace = true

@@ -8,7 +8,14 @@
 //! - `docs/05-wire-protocol.md`
 //! - `docs/02-architecture.md`
 //!
-//! Status: scaffold only (see `PROGRESS.md`).
+//! - [`connect`]: how a controller reaches a host: LAN, then a direct punch
+//!   (IPv4 and IPv6), then the relay, logging which path won.
+//!
+//! Status: connection strategy done; session, decode and input come next.
+
+pub mod connect;
+
+pub use connect::{ConnectOptions, ConnectPlan, Established, PathKind, connect};
 
 /// Spec documents, relative to the workspace root, that describe this crate's behaviour.
 pub const SPEC_DOCS: &[&str] = &["docs/05-wire-protocol.md", "docs/02-architecture.md"];

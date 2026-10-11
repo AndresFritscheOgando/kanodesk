@@ -37,9 +37,8 @@ fn transport_config() -> Result<TransportConfig, TransportError> {
     Ok(config)
 }
 
-/// Creates a server endpoint bound to `bind`, presenting `identity`.
-/// Must be called inside a tokio runtime.
-pub fn server(bind: SocketAddr, identity: &Identity) -> Result<Endpoint, TransportError> {
+/// QUIC server settings presenting `identity`.
+pub(crate) fn server_config(identity: &Identity) -> Result<quinn::ServerConfig, TransportError> {
     let mut tls = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
@@ -49,12 +48,11 @@ pub fn server(bind: SocketAddr, identity: &Identity) -> Result<Endpoint, Transpo
         QuicServerConfig::try_from(tls).map_err(|e| TransportError::Other(e.to_string()))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(Arc::new(transport_config()?));
-    Ok(Endpoint::server(config, bind)?)
+    Ok(config)
 }
 
-/// Creates a client endpoint bound to `bind` (use port 0) that trusts servers
-/// according to `trust`. Must be called inside a tokio runtime.
-pub fn client(bind: SocketAddr, trust: ServerTrust) -> Result<Endpoint, TransportError> {
+/// QUIC client settings trusting servers according to `trust`.
+pub(crate) fn client_config(trust: ServerTrust) -> Result<quinn::ClientConfig, TransportError> {
     let provider = provider();
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -66,8 +64,20 @@ pub fn client(bind: SocketAddr, trust: ServerTrust) -> Result<Endpoint, Transpor
         QuicClientConfig::try_from(tls).map_err(|e| TransportError::Other(e.to_string()))?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
     config.transport_config(Arc::new(transport_config()?));
+    Ok(config)
+}
+
+/// Creates a server endpoint bound to `bind`, presenting `identity`.
+/// Must be called inside a tokio runtime.
+pub fn server(bind: SocketAddr, identity: &Identity) -> Result<Endpoint, TransportError> {
+    Ok(Endpoint::server(server_config(identity)?, bind)?)
+}
+
+/// Creates a client endpoint bound to `bind` (use port 0) that trusts servers
+/// according to `trust`. Must be called inside a tokio runtime.
+pub fn client(bind: SocketAddr, trust: ServerTrust) -> Result<Endpoint, TransportError> {
     let mut endpoint = Endpoint::client(bind)?;
-    endpoint.set_default_client_config(config);
+    endpoint.set_default_client_config(client_config(trust)?);
     Ok(endpoint)
 }
 
@@ -93,6 +103,15 @@ pub fn channel_binding(conn: &Connection) -> Result<[u8; 32], TransportError> {
 /// Closes one connection immediately with application code 0.
 pub fn close(conn: &Connection, reason: &[u8]) {
     conn.close(VarInt::from_u32(0), reason);
+}
+
+/// Whether the peer closed `conn` deliberately (rather than the connection
+/// failing, timing out or being closed here).
+pub fn closed_by_peer(conn: &Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(quinn::ConnectionError::ApplicationClosed(_))
+    )
 }
 
 /// Closes every connection on `endpoint` and waits (up to 500 ms) for the
@@ -207,18 +226,21 @@ mod tests {
         let host = tokio::spawn(async move {
             let conn = accept(&server).await.unwrap().unwrap();
             // Must end well before the idle timeout.
-            tokio::time::timeout(Duration::from_secs(2), conn.closed())
+            let reason = tokio::time::timeout(Duration::from_secs(2), conn.closed())
                 .await
-                .expect("close noticed promptly")
+                .expect("close noticed promptly");
+            (reason, conn)
         });
         let client = client(localhost(0), ServerTrust::Pinned(identity.fingerprint())).unwrap();
         let conn = connect(&client, addr).await.unwrap();
         close(&conn, b"bye");
-        let reason = host.await.unwrap();
+        let (reason, host_conn) = host.await.unwrap();
         assert!(matches!(
             reason,
             quinn::ConnectionError::ApplicationClosed(_)
         ));
+        assert!(closed_by_peer(&host_conn));
+        assert!(!closed_by_peer(&conn), "closed locally, not by the peer");
     }
 
     #[tokio::test]

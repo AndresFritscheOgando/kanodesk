@@ -8,7 +8,12 @@
 //! - `docs/02-architecture.md`
 //! - `docs/12-config-storage.md`
 //!
-//! Status: scaffold only (see `PROGRESS.md`).
+//! - [`p2p`]: `p2p-host` / `p2p-connect` network diagnostics (ID server,
+//!   NAT detection, hole punching, relay).
+//!
+//! Status: network diagnostics only; provisioning commands come later.
+
+pub mod p2p;
 
 /// Package version, shown by the binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -2,9 +2,18 @@
 //!
 //! ```text
 //! spike-host [--listen 127.0.0.1:9000] [--fps 30] [--bitrate KBPS] [--speed 6] [--display N]
+//!            [--data-dir DIR] [--password-length 8] [--set-permanent PASSWORD | --clear-permanent]
+//!            [--reset-login-limits]
 //! ```
 //!
-//! Prints a certificate fingerprint; pass it to `spike-viewer --pin`.
+//! Prints its device key and a temporary password; the viewer needs both
+//! (`spike-viewer --host-key KEY`, then the password). A viewer must log in
+//! (Noise IK bound to TLS, then SPAKE2) before any video flows, and a new
+//! viewer replaces the current one only after it has logged in. A temporary
+//! password admits one login (a new one is printed). Login failures,
+//! backoffs and bans are kept in `--data-dir` across restarts
+//! (`--reset-login-limits` forgets them). The device key (and any permanent
+//! password) is kept DPAPI-protected in `--data-dir`.
 //! Each viewer gets its own capture and encoder (16 §4, per-viewer encoder).
 
 #[cfg(windows)]
@@ -22,22 +31,29 @@ fn main() {
 
 #[cfg(windows)]
 mod host {
-    use std::net::SocketAddr;
-    use std::sync::Arc;
+    use std::net::{IpAddr, SocketAddr};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use kanodesk_capture::{Capturer, DisplayInfo, PlatformCapturer, clock, primary_display};
     use kanodesk_codec::{Encoder, EncoderConfig, I420Frame, Vp9Encoder, convert};
-    use kanodesk_proto::hello;
-    use kanodesk_proto::v1::{
-        self, Capability, CloseReason, Codec, ControlMessage, VideoMessage, control_message,
+    use kanodesk_crypto::password::{
+        Charset, DEFAULT_TEMPORARY_LEN, HostPasswords, TemporaryPolicy,
     };
+    use kanodesk_crypto::throttle::{self, LoginThrottle, ThrottleConfig};
+    use kanodesk_crypto::{DeviceIdentity, PasswordKind};
+    use kanodesk_proto::v1::{self, Capability, CloseReason, Codec, VideoMessage, control_message};
     use kanodesk_spike::stats::Samples;
-    use kanodesk_spike::{DEFAULT_ADDR, spike_hello};
-    use kanodesk_transport::streams::{ControlReader, ControlWriter};
+    use kanodesk_spike::{
+        AGENT, DEFAULT_ADDR, default_data_dir, device_identity, key_store, spike_hello,
+    };
+    use kanodesk_transport::session::{
+        HostAuth, HostSession, SessionError, host_handshake, local_peer_info,
+    };
     use kanodesk_transport::tls::Identity;
-    use kanodesk_transport::{Connection, endpoint, streams};
+    use kanodesk_transport::{Connection, RecvStream, SendStream, endpoint, streams};
     use tokio::sync::mpsc;
 
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -49,7 +65,43 @@ mod host {
         bitrate: Option<u32>,
         speed: i32,
         display: Option<u32>,
+        data_dir: PathBuf,
+        password_length: usize,
+        /// `Some(Some(p))` sets the permanent password, `Some(None)` clears it.
+        permanent: Option<Option<String>>,
+        reset_login_limits: bool,
     }
+
+    /// Login failures, backoffs and bans, kept across restarts (in the data dir).
+    const THROTTLE_FILE: &str = "login-throttle";
+
+    /// Login state shared by all connections.
+    struct Shared {
+        identity: DeviceIdentity,
+        passwords: Mutex<HostPasswords>,
+        throttle: Mutex<LoginThrottle<IpAddr>>,
+        throttle_path: PathBuf,
+    }
+
+    impl Shared {
+        /// Saves the login throttle so a restart does not reset it.
+        fn save_throttle(&self) {
+            let throttle = self.throttle.lock().expect("not poisoned");
+            if let Err(e) = throttle::save(&self.throttle_path, &throttle) {
+                eprintln!("could not save login limits: {e}");
+            }
+        }
+
+        fn temporary(&self) -> String {
+            self.passwords
+                .lock()
+                .expect("not poisoned")
+                .temporary()
+                .to_owned()
+        }
+    }
+
+    type Session = HostSession<RecvStream, SendStream>;
 
     fn parse_args() -> Result<Settings, String> {
         let mut s = Settings {
@@ -58,6 +110,10 @@ mod host {
             bitrate: None,
             speed: 6,
             display: None,
+            data_dir: default_data_dir("spike-host"),
+            password_length: DEFAULT_TEMPORARY_LEN,
+            permanent: None,
+            reset_login_limits: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -69,6 +125,11 @@ mod host {
                 "--bitrate" => s.bitrate = Some(num(value()?)?.max(1) as u32),
                 "--speed" => s.speed = num(value()?)? as i32,
                 "--display" => s.display = Some(num(value()?)? as u32),
+                "--data-dir" => s.data_dir = PathBuf::from(value()?),
+                "--password-length" => s.password_length = num(value()?)?.max(0) as usize,
+                "--set-permanent" => s.permanent = Some(Some(value()?)),
+                "--clear-permanent" => s.permanent = Some(None),
+                "--reset-login-limits" => s.reset_login_limits = true,
                 other => return Err(format!("unknown argument {other}")),
             }
         }
@@ -77,41 +138,91 @@ mod host {
 
     pub fn run() -> Result<(), BoxError> {
         let settings = parse_args()?;
+        let store = key_store(&settings.data_dir)?;
+        let identity = device_identity(store.as_ref())?;
+        let policy = TemporaryPolicy::new(settings.password_length, Charset::Alphanumeric)?;
+        let mut passwords = HostPasswords::load(policy, store.as_ref())?;
+        if let Some(permanent) = &settings.permanent {
+            passwords.set_permanent(permanent.as_deref(), store.as_ref())?;
+            println!(
+                "permanent password {}",
+                if permanent.is_some() {
+                    "saved"
+                } else {
+                    "cleared"
+                }
+            );
+        }
+        let has_permanent = passwords.has_permanent();
+        let throttle_path = settings.data_dir.join(THROTTLE_FILE);
+        if settings.reset_login_limits {
+            match std::fs::remove_file(&throttle_path) {
+                Ok(()) => println!("login limits reset"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let shared = Arc::new(Shared {
+            identity,
+            passwords: Mutex::new(passwords),
+            throttle: Mutex::new(throttle::load(&throttle_path, ThrottleConfig::default())),
+            throttle_path,
+        });
+
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
-            let identity = Identity::self_signed()?;
-            let server = endpoint::server(settings.listen, &identity)?;
+            let tls = Identity::self_signed()?;
+            let server = endpoint::server(settings.listen, &tls)?;
             let addr = server.local_addr()?;
+            let key = shared.identity.public_key();
             println!("spike-host listening on {addr}");
-            println!("certificate fingerprint {}", identity.fingerprint());
+            println!("device key {key}  ({})", settings.data_dir.display());
             println!(
-                "run: cargo run --release -p kanodesk-spike --bin spike-viewer -- --connect {addr} --pin {}",
-                identity.fingerprint()
+                "temporary password {}{}",
+                shared.temporary(),
+                if has_permanent { " (a permanent password is also set)" } else { "" }
             );
-            // One viewer at a time: DXGI allows a single duplication per output
-            // per process, so a new viewer replaces the current one.
-            let mut active: Option<(Connection, tokio::task::JoinHandle<()>)> = None;
-            while let Some(incoming) = endpoint::accept(&server).await {
-                let conn = match incoming {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        eprintln!("incoming connection failed: {e}");
-                        continue;
+            println!(
+                "run: cargo run --release -p kanodesk-spike --bin spike-viewer -- --connect {addr} --host-key {key} --pin {}",
+                tls.fingerprint()
+            );
+
+            // Log-ins run concurrently; only a logged-in viewer reaches this channel.
+            let (ready_tx, mut ready_rx) = mpsc::channel::<(Connection, Session)>(4);
+            let accept_shared = shared.clone();
+            tokio::spawn(async move {
+                while let Some(incoming) = endpoint::accept(&server).await {
+                    match incoming {
+                        Ok(conn) => {
+                            tokio::spawn(log_in(conn, accept_shared.clone(), ready_tx.clone()));
+                        }
+                        Err(e) => eprintln!("incoming connection failed: {e}"),
                     }
-                };
+                }
+            });
+
+            // One viewer at a time: DXGI allows a single duplication per output
+            // per process, so a new (logged-in) viewer replaces the current one.
+            let mut active: Option<(Connection, tokio::task::JoinHandle<()>)> = None;
+            while let Some((conn, session)) = ready_rx.recv().await {
                 if let Some((old, task)) = active.take() {
-                    println!("replacing viewer {}", old.remote_address());
-                    endpoint::close(&old, b"replaced by a new viewer");
+                    if !task.is_finished() {
+                        println!("replacing viewer {}", old.remote_address());
+                        endpoint::close(&old, b"replaced by a new viewer");
+                    }
                     // Wait until its capture thread has released the duplication.
                     let _ = task.await;
                 }
                 let settings = settings.clone();
-                let session = conn.clone();
+                let session_conn = conn.clone();
                 let task = tokio::spawn(async move {
-                    let peer = session.remote_address();
-                    println!("viewer {peer} connected");
-                    match serve(session, settings).await {
+                    let peer = session_conn.remote_address();
+                    let watched = session_conn.clone();
+                    match serve(session_conn, session, settings).await {
                         Ok(()) => println!("viewer {peer} done"),
+                        Err(_) if endpoint::closed_by_peer(&watched) => {
+                            println!("viewer {peer} disconnected")
+                        }
                         Err(e) => println!("viewer {peer} ended: {e}"),
                     }
                 });
@@ -119,6 +230,75 @@ mod host {
             }
             Ok(())
         })
+    }
+
+    /// Authenticates one connection; passes it on only after a successful
+    /// login by a viewer that can take VP9.
+    async fn log_in(
+        conn: Connection,
+        shared: Arc<Shared>,
+        ready: mpsc::Sender<(Connection, Session)>,
+    ) {
+        let peer = conn.remote_address();
+        let auth = HostAuth {
+            identity: &shared.identity,
+            passwords: &shared.passwords,
+            throttle: &shared.throttle,
+            peer_info: local_peer_info(AGENT, &[Codec::Vp9]),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            host_handshake(&conn, &auth, &spike_hello()),
+        )
+        .await;
+        shared.save_throttle();
+        let mut session = match result {
+            Ok(Ok(session)) => session,
+            Ok(Err(e)) => {
+                println!("login from {peer} failed: {e}");
+                if let SessionError::Rejected {
+                    rotated_temporary: true,
+                    ..
+                } = e
+                {
+                    println!(
+                        "too many failures: new temporary password {}",
+                        shared.temporary()
+                    );
+                }
+                // Let the refusal reach the viewer; it closes the connection.
+                let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+                endpoint::close(&conn, b"login failed");
+                return;
+            }
+            Err(_) => {
+                println!("login from {peer} timed out");
+                endpoint::close(&conn, b"login timed out");
+                return;
+            }
+        };
+        if !session.negotiated.has(Capability::VideoVp9) {
+            println!("viewer {peer} cannot decode VP9");
+            let close = v1::Close {
+                reason: CloseReason::Error as i32,
+                detail: "viewer cannot decode VP9".into(),
+            };
+            let _ = session.control.send(&close.into()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+            return;
+        }
+        println!(
+            "viewer {peer} logged in: device {} with the {:?} password; protocol v{}, capabilities {:?}",
+            session.control.remote(),
+            session.password,
+            session.negotiated.version,
+            session.negotiated.capabilities
+        );
+        if session.password == PasswordKind::Temporary {
+            // Each temporary password admits one login.
+            println!("new temporary password {}", shared.temporary());
+        }
+        let _ = ready.send((conn, session)).await;
     }
 
     fn pick_display(settings: &Settings) -> Result<DisplayInfo, BoxError> {
@@ -130,51 +310,10 @@ mod host {
         Ok(found.ok_or("display not found")?.clone())
     }
 
-    /// Exchanges `Hello` on the control stream and checks the viewer can
-    /// take what this host sends. On a mismatch the viewer gets a `Close`.
-    async fn handshake(
-        send: &mut ControlWriter,
-        recv: &mut ControlReader,
-    ) -> Result<hello::Negotiated, BoxError> {
-        let theirs = match recv.next().await? {
-            Some(ControlMessage {
-                msg: Some(control_message::Msg::Hello(h)),
-            }) => h,
-            other => return Err(format!("expected Hello, got {other:?}").into()),
-        };
-        let ours = spike_hello();
-        send.send(&ours.clone().into()).await?;
-        let refusal = match hello::negotiate(&ours, &theirs) {
-            Ok(n) if n.has(Capability::VideoVp9) => {
-                println!(
-                    "viewer agent {:?}: protocol v{}, capabilities {:?}",
-                    theirs.agent, n.version, n.capabilities
-                );
-                return Ok(n);
-            }
-            Ok(_) => (CloseReason::Error, "viewer cannot decode VP9".to_owned()),
-            Err(e) => (CloseReason::IncompatibleVersion, e.to_string()),
-        };
-        send.send(
-            &v1::Close {
-                reason: refusal.0 as i32,
-                detail: refusal.1.clone(),
-            }
-            .into(),
-        )
-        .await?;
-        // Let the Close reach the viewer before the connection goes away.
-        let stream = send.get_mut();
-        stream.finish()?;
-        let _ = tokio::time::timeout(Duration::from_secs(1), stream.stopped()).await;
-        Err(refusal.1.into())
-    }
-
-    /// Serves one viewer: `Hello` exchange, then capture thread → channel →
-    /// video stream, and control stream → keyframe flag.
-    async fn serve(conn: Connection, settings: Settings) -> Result<(), BoxError> {
-        let (mut control_send, mut control_recv) = streams::accept_control(&conn).await?;
-        handshake(&mut control_send, &mut control_recv).await?;
+    /// Serves one logged-in viewer: capture thread → channel → video stream,
+    /// and sealed control stream → keyframe flag.
+    async fn serve(conn: Connection, session: Session, settings: Settings) -> Result<(), BoxError> {
+        let mut control_stream = session.control;
 
         let display = pick_display(&settings)?;
         let keyframe = Arc::new(AtomicBool::new(true));
@@ -195,9 +334,7 @@ mod host {
         let control = {
             let keyframe = keyframe.clone();
             tokio::spawn(async move {
-                // Keep the send half alive for the session.
-                let _send = control_send;
-                while let Some(msg) = control_recv.next().await? {
+                while let Some(msg) = control_stream.recv().await? {
                     match msg.msg {
                         Some(control_message::Msg::KeyframeRequest(_)) => {
                             keyframe.store(true, Ordering::Relaxed)

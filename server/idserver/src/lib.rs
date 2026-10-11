@@ -122,6 +122,12 @@ pub struct ServerConfig {
     /// empty, the list persisted by an earlier run (or `set-relays`) is used;
     /// if not, it replaces the persisted list.
     pub relays: Vec<String>,
+    /// Second UDP address answering NAT probes (03 §4); `None` disables NAT
+    /// type detection for clients. Usually the main port minus one.
+    pub nat_test_listen: Option<SocketAddr>,
+    /// Secret shared with the relay servers; relay tickets are issued only
+    /// when set (otherwise relays must run in open mode).
+    pub relay_secret: Option<kanodesk_transport::relay::RelaySecret>,
     /// Networks exempt from the per-IP and new-ID-per-IP limits (for
     /// example a large office NAT). Per-device and per-target limits still apply.
     pub trusted_networks: Vec<Cidr>,
@@ -138,6 +144,8 @@ impl ServerConfig {
             limits: Limits::default(),
             relays: Vec::new(),
             trusted_networks: Vec::new(),
+            nat_test_listen: None,
+            relay_secret: None,
             touch_interval: Duration::from_secs(300),
         }
     }
@@ -146,6 +154,7 @@ impl ServerConfig {
 /// A running server.
 pub struct IdServer {
     endpoint: Endpoint,
+    nat_endpoint: Option<Endpoint>,
     shared: Arc<session::Shared>,
     accept_task: tokio::task::JoinHandle<()>,
     touch_task: tokio::task::JoinHandle<()>,
@@ -170,23 +179,44 @@ pub async fn start(config: ServerConfig, signing: DeviceIdentity) -> Result<IdSe
         config.limits,
         relays,
         config.trusted_networks,
+        config.relay_secret,
     ));
     // TLS uses a throwaway certificate: clients authenticate the server by
     // its signed ServerHello, bound to the TLS session.
-    let endpoint = endpoint::server(config.listen, &Identity::self_signed()?)?;
+    let tls = Identity::self_signed()?;
+    let endpoint = endpoint::server(config.listen, &tls)?;
+    let nat_endpoint = match config.nat_test_listen {
+        Some(addr) => Some(endpoint::server(addr, &tls)?),
+        None => None,
+    };
 
-    let accept_endpoint = endpoint.clone();
-    let accept_shared = shared.clone();
-    let accept_task = tokio::spawn(async move {
-        while let Some(incoming) = accept_endpoint.accept().await {
-            let shared = accept_shared.clone();
-            tokio::spawn(async move {
-                if let Ok(conn) = incoming.await {
-                    session::serve(conn, &shared).await;
+    // Both listeners serve the full protocol; the second exists so clients
+    // can compare the address each one sees.
+    let accept_task = {
+        let endpoints: Vec<Endpoint> = std::iter::once(endpoint.clone())
+            .chain(nat_endpoint.clone())
+            .collect();
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let loops = endpoints.into_iter().map(|ep| {
+                let shared = shared.clone();
+                async move {
+                    while let Some(incoming) = ep.accept().await {
+                        let shared = shared.clone();
+                        tokio::spawn(async move {
+                            if let Ok(conn) = incoming.await {
+                                session::serve(conn, &shared).await;
+                            }
+                        });
+                    }
                 }
             });
-        }
-    });
+            let handles: Vec<_> = loops.map(tokio::spawn).collect();
+            for h in handles {
+                let _ = h.await;
+            }
+        })
+    };
     // Online devices: refresh last_seen periodically, not only on register
     // and disconnect.
     let touch_shared = shared.clone();
@@ -208,6 +238,7 @@ pub async fn start(config: ServerConfig, signing: DeviceIdentity) -> Result<IdSe
     });
     Ok(IdServer {
         endpoint,
+        nat_endpoint,
         shared,
         accept_task,
         touch_task,
@@ -219,6 +250,11 @@ impl IdServer {
     /// The bound address.
     pub fn local_addr(&self) -> Result<SocketAddr, ServerError> {
         Ok(self.endpoint.local_addr()?)
+    }
+
+    /// The NAT-test address, if enabled.
+    pub fn nat_test_addr(&self) -> Option<SocketAddr> {
+        self.nat_endpoint.as_ref().and_then(|e| e.local_addr().ok())
     }
 
     /// The key clients must pin.
@@ -244,6 +280,9 @@ impl IdServer {
     /// Closes every connection and the database.
     pub async fn shutdown(self) {
         endpoint::shutdown(&self.endpoint, b"server shutting down").await;
+        if let Some(nat) = &self.nat_endpoint {
+            endpoint::shutdown(nat, b"server shutting down").await;
+        }
         self.accept_task.abort();
         self.touch_task.abort();
         let _ = tokio::time::timeout(Duration::from_secs(2), self.accept_task).await;

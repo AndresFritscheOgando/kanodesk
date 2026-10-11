@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kanodesk_crypto::{DeviceIdentity, DevicePublicKey};
-use kanodesk_proto::v1::{self, RendezvousError, RendezvousMessage, rendezvous_message::Msg};
+use kanodesk_proto::v1::{
+    self, NatType, RendezvousError, RendezvousMessage, rendezvous_message::Msg,
+};
 use kanodesk_transport::streams::{RendezvousWriter, open_rendezvous};
 use kanodesk_transport::{Connection, Endpoint, endpoint};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -60,6 +62,12 @@ pub struct ConnectInfo {
     pub relay: Option<String>,
     /// Token both sides present to the relay so it can pair them.
     pub relay_session: Option<[u8; 16]>,
+    /// The relay's proof that the ID server issued the session.
+    pub relay_ticket: Vec<u8>,
+    /// The host's LAN (same network only) and global IPv6 addresses.
+    pub host_local_addrs: Vec<SocketAddr>,
+    /// The host's reported NAT type.
+    pub host_nat: NatType,
 }
 
 /// A controller wants to connect to this device.
@@ -75,6 +83,25 @@ pub struct IncomingRequest {
     pub relay: Option<String>,
     /// Token both sides present to the relay so it can pair them.
     pub relay_session: Option<[u8; 16]>,
+    /// The relay's proof that the ID server issued the session.
+    pub relay_ticket: Vec<u8>,
+    /// The controller's LAN (same network only) and global IPv6 addresses.
+    pub controller_local_addrs: Vec<SocketAddr>,
+    /// The controller's reported NAT type.
+    pub controller_nat: NatType,
+}
+
+/// What a device tells the ID server about its network when registering.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkInfo {
+    /// Local addresses on the device socket's port (LAN and IPv6 candidates).
+    pub local_addrs: Vec<SocketAddr>,
+    /// Detected NAT type.
+    pub nat: NatType,
+}
+
+fn parse_addrs(list: &[String]) -> Vec<SocketAddr> {
+    list.iter().filter_map(|a| a.parse().ok()).collect()
 }
 
 fn session_token(bytes: &[u8]) -> Option<[u8; 16]> {
@@ -245,7 +272,21 @@ impl RendezvousClient {
         identity: &DeviceIdentity,
         saved_id: Option<DeviceId>,
     ) -> Result<VerifiedRecord, ClientError> {
-        let register = sign_register(identity, &self.channel_binding, saved_id);
+        self.register_with(identity, saved_id, &NetworkInfo::default())
+            .await
+    }
+
+    /// [`register`](Self::register), also reporting this device's local
+    /// addresses and NAT type so peers can try LAN and IPv6 paths.
+    pub async fn register_with(
+        &self,
+        identity: &DeviceIdentity,
+        saved_id: Option<DeviceId>,
+        network: &NetworkInfo,
+    ) -> Result<VerifiedRecord, ClientError> {
+        let mut register = sign_register(identity, &self.channel_binding, saved_id);
+        register.local_addrs = network.local_addrs.iter().map(|a| a.to_string()).collect();
+        register.nat_type = network.nat as i32;
         let reply = self.request(Msg::Register(register)).await?;
         let Msg::RegisterResult(result) = reply else {
             return Err(Self::unexpected("RegisterResult", &reply));
@@ -352,6 +393,9 @@ impl RendezvousClient {
             controller_addr: parse_addr(&result.controller_addr)?,
             relay: non_empty(result.relay),
             relay_session: session_token(&result.relay_session),
+            relay_ticket: result.relay_ticket,
+            host_local_addrs: parse_addrs(&result.host_local_addrs),
+            host_nat: NatType::try_from(result.host_nat).unwrap_or_default(),
         })
     }
 
@@ -376,9 +420,49 @@ impl RendezvousClient {
                 host_addr,
                 relay: non_empty(push.relay),
                 relay_session: session_token(&push.relay_session),
+                relay_ticket: push.relay_ticket,
+                controller_local_addrs: parse_addrs(&push.controller_local_addrs),
+                controller_nat: NatType::try_from(push.controller_nat).unwrap_or_default(),
             });
         }
         None
+    }
+
+    /// The address the server sees for this connection.
+    pub async fn nat_probe(&self) -> Result<SocketAddr, ClientError> {
+        match self.request(Msg::NatProbe(v1::NatProbe {})).await? {
+            Msg::NatProbeResult(r) => parse_addr(&r.observed_addr),
+            other => Err(Self::unexpected("NatProbeResult", &other)),
+        }
+    }
+
+    /// Detects the NAT type (03 §4): asks this connection's server port and
+    /// the server's NAT-test port, from the same socket (`endpoint`, local
+    /// port `local_port`), which address they see, and compares.
+    pub async fn detect_nat(
+        &self,
+        endpoint: &Endpoint,
+        nat_test_addr: SocketAddr,
+        local_port: u16,
+    ) -> Result<NatType, ClientError> {
+        let main = self.nat_probe().await?;
+        let second = RendezvousClient::connect(
+            endpoint,
+            RendezvousConfig {
+                server_addr: nat_test_addr,
+                ..self.config
+            },
+        )
+        .await?;
+        let test = second.nat_probe().await;
+        second.close();
+        let test = test?;
+        Ok(kanodesk_transport::nat::classify(
+            &kanodesk_transport::nat::local_ips(),
+            local_port,
+            main,
+            test,
+        ))
     }
 
     /// Application-level keep-alive: a round trip to the server.

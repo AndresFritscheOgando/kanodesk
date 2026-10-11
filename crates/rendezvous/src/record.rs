@@ -78,6 +78,8 @@ pub fn sign_register(
             .sign(&message(REGISTER_LABEL, &[channel_binding, id.as_bytes()]))
             .to_vec(),
         id,
+        // Network details are added by the caller; they are not signed.
+        ..Default::default()
     }
 }
 

@@ -8,6 +8,19 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+kanodesk-proto.workspace = true
+kanodesk-rendezvous.workspace = true
+kanodesk-transport.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+getrandom.workspace = true
+kanodesk-crypto.workspace = true
+kanodesk-host.workspace = true
+kanodesk-idserver = { path = "../../server/idserver" }
+kanodesk-relay = { path = "../../server/relay" }
 
 [lints]
 workspace = true

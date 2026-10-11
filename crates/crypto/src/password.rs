@@ -116,6 +116,7 @@ pub fn normalize_temporary(input: &str) -> String {
 pub struct HostPasswords {
     policy: TemporaryPolicy,
     temporary: Zeroizing<String>,
+    generation: u64,
     permanent: Option<Zeroizing<String>>,
 }
 
@@ -124,6 +125,7 @@ impl HostPasswords {
     pub fn new(policy: TemporaryPolicy) -> Result<Self, CryptoError> {
         Ok(HostPasswords {
             temporary: generate(&policy)?,
+            generation: 0,
             policy,
             permanent: None,
         })
@@ -153,7 +155,15 @@ impl HostPasswords {
     /// Replaces the temporary password with a new random one.
     pub fn rotate_temporary(&mut self) -> Result<&str, CryptoError> {
         self.temporary = generate(&self.policy)?;
+        self.generation += 1;
         Ok(&self.temporary)
+    }
+
+    /// Counts temporary passwords: changes on every rotation. A login
+    /// records it when it starts, so it can tell at the end whether the
+    /// password it checked is still the current one.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Whether a permanent password is set.
@@ -263,8 +273,10 @@ mod tests {
     fn rotation_changes_the_temporary_password() {
         let mut pw = HostPasswords::new(TemporaryPolicy::default()).unwrap();
         let before = pw.temporary().to_owned();
+        assert_eq!(pw.generation(), 0);
         let after = pw.rotate_temporary().unwrap().to_owned();
         assert_ne!(before, after);
+        assert_eq!(pw.generation(), 1);
     }
 
     #[test]

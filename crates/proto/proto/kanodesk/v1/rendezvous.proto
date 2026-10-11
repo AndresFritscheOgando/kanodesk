@@ -33,6 +33,32 @@ message Register {
   bytes device_key = 1;
   string id = 2;
   bytes signature = 3;
+  // Not signed (a device can only mislead about itself): the device's own
+  // local addresses ("ip:port", same UDP port as this connection) and the
+  // NAT type it detected. Used to offer LAN and IPv6 paths.
+  repeated string local_addrs = 4;
+  NatType nat_type = 5;
+}
+
+// What kind of NAT a device is behind (03 §4).
+enum NatType {
+  NAT_TYPE_UNKNOWN = 0;
+  // No NAT: the address the server sees is the device's own.
+  NAT_TYPE_OPEN = 1;
+  // Endpoint-independent mapping: the same public port toward every
+  // destination, so hole punching works (RustDesk's "ASYMMETRIC").
+  NAT_TYPE_CONE = 2;
+  // A different public port per destination: punching is unlikely to work.
+  NAT_TYPE_SYMMETRIC = 3;
+}
+
+// Asks which address the server sees for this connection. The ID server
+// answers on its main port and on its NAT-test port; comparing the two
+// answers from one UDP socket gives the NAT type.
+message NatProbe {}
+
+message NatProbeResult {
+  string observed_addr = 1;
 }
 
 // What the server vouches for: this ID belongs to this key.
@@ -97,6 +123,12 @@ message ConnectResult {
   string relay = 4;
   // 16 random bytes both sides present to the relay so it can pair them.
   bytes relay_session = 5;
+  // The host's local addresses: global IPv6 always, private IPv4 only when
+  // both devices share a public IP (same network).
+  repeated string host_local_addrs = 6;
+  // Proof for the relay that the ID server issued relay_session.
+  bytes relay_ticket = 7;
+  NatType host_nat = 8;
 }
 
 // Server to host (push): a controller wants to connect.
@@ -107,6 +139,10 @@ message IncomingConnect {
   // Same relay and relay session as in the controller's ConnectResult.
   string relay = 4;
   bytes relay_session = 5;
+  // The controller's local addresses, filtered like host_local_addrs.
+  repeated string controller_local_addrs = 6;
+  bytes relay_ticket = 7;
+  NatType controller_nat = 8;
 }
 
 // Server to device (push): current server-side configuration. Sent after
@@ -215,5 +251,7 @@ message RendezvousMessage {
     AdminSetRelays admin_set_relays = 21;
     AdminDevices admin_devices = 22;
     AdminResult admin_result = 23;
+    NatProbe nat_probe = 24;
+    NatProbeResult nat_probe_result = 25;
   }
 }

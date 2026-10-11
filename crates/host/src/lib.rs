@@ -9,7 +9,12 @@
 //! - `docs/11-host-server-side.md`
 //! - `docs/02-architecture.md`
 //!
-//! Status: scaffold only (see `PROGRESS.md`).
+//! - [`incoming`]: on a forwarded connect request, punch toward the
+//!   controller and bind at the relay.
+//!
+//! Status: connection setup done; services and permissions come next.
+
+pub mod incoming;
 
 /// Spec documents, relative to the workspace root, that describe this crate's behaviour.
 pub const SPEC_DOCS: &[&str] = &["docs/11-host-server-side.md", "docs/02-architecture.md"];

@@ -7,7 +7,7 @@
 //! display.
 
 use kanodesk_proto::v1::{
-    ControlMessage, RendezvousMessage, StreamHeader, StreamKind, VideoMessage,
+    ControlMessage, RelayMessage, RendezvousMessage, StreamHeader, StreamKind, VideoMessage,
 };
 use kanodesk_proto::{FrameCodec, MessageReader, MessageWriter, ProtoCodec};
 use quinn::{Connection, RecvStream, SendStream};
@@ -156,6 +156,35 @@ pub async fn accept_rendezvous(
     if header.kind() != StreamKind::Rendezvous {
         return Err(TransportError::BadStreamHeader(format!(
             "expected a rendezvous stream, got {:?}",
+            header.kind()
+        )));
+    }
+    Ok((MessageWriter::new(send), reader.into_typed()))
+}
+
+/// Sends relay control messages.
+pub type RelayWriter = MessageWriter<SendStream, RelayMessage>;
+/// Receives relay control messages.
+pub type RelayReader = MessageReader<RecvStream, RelayMessage>;
+
+/// Largest message on a relay control stream.
+pub const RELAY_MAX_FRAME: usize = 4 * 1024;
+
+/// Peer side: opens the control stream to a relay.
+pub async fn open_relay(conn: &Connection) -> Result<(RelayWriter, RelayReader), TransportError> {
+    let (send, recv) = conn.open_bi().await?;
+    let writer = write_header(send, StreamKind::Relay, 0).await?;
+    Ok((writer.into_typed(), MessageReader::new(recv)))
+}
+
+/// Relay side: accepts a peer's control stream.
+pub async fn accept_relay(conn: &Connection) -> Result<(RelayWriter, RelayReader), TransportError> {
+    let (send, recv) = conn.accept_bi().await?;
+    let codec = ProtoCodec::with_frames(FrameCodec::with_max_len(RELAY_MAX_FRAME));
+    let (header, reader) = read_header_with(recv, codec).await?;
+    if header.kind() != StreamKind::Relay {
+        return Err(TransportError::BadStreamHeader(format!(
+            "expected a relay stream, got {:?}",
             header.kind()
         )));
     }

@@ -10,8 +10,16 @@ publish.workspace = true
 [[bin]]
 name = "kanodesk-relay"
 path = "src/main.rs"
+# main.rs only parses arguments; tests live in the library and tests/.
+test = false
 
 [dependencies]
+getrandom.workspace = true
+kanodesk-proto.workspace = true
+kanodesk-transport.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

@@ -34,6 +34,10 @@ pub struct Online {
     pub push: mpsc::Sender<RendezvousMessage>,
     /// The connection, so an operator can disconnect it.
     pub conn: Connection,
+    /// Local addresses the device reported (LAN and IPv6 candidates).
+    pub local_addrs: Vec<SocketAddr>,
+    /// NAT type the device reported.
+    pub nat: kanodesk_proto::v1::NatType,
 }
 
 /// Registry state.

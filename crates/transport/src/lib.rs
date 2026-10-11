@@ -17,6 +17,14 @@
 //!   and then carries that stream's envelope type, framed by
 //!   `kanodesk_proto::codec`.
 //!
+//! - [`peer`]: a device's single dual-stack UDP socket, used for the ID
+//!   server, peers and the relay, plus raw sends for hole punching.
+//! - [`nat`]: NAT classification, local address discovery, hole punching.
+//! - [`relay`]: relay binding, hellos and the ID server's relay tickets.
+//! - [`upnp`]: best-effort UPnP port mapping on the router.
+//! - [`session`]: Noise IK (bound to TLS) + sealed control + SPAKE2 login
+//!   on the control stream (16 §5).
+//!
 //! Video frames currently travel reliably on the video stream. 16 §4 wants them
 //! unreliable with keyframe recovery; that comes with QoS work.
 //!
@@ -24,11 +32,16 @@
 //! - `docs/03-networking-rendezvous.md`
 //! - `docs/16-clone-blueprint.md`
 //!
-//! Status: phase 0 spike (see `PROGRESS.md`).
+//! Status: QUIC transport, stream layout, NAT traversal and relay client.
 
 pub mod endpoint;
+pub mod nat;
+pub mod peer;
+pub mod relay;
+pub mod session;
 pub mod streams;
 pub mod tls;
+pub mod upnp;
 
 pub use quinn::{Connection, Endpoint, RecvStream, SendStream};
 

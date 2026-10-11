@@ -28,8 +28,11 @@ pub mod client;
 pub mod id;
 pub mod record;
 
-pub use client::{ConnectInfo, IncomingRequest, PeerLookup, RendezvousClient, RendezvousConfig};
+pub use client::{
+    ConnectInfo, IncomingRequest, NetworkInfo, PeerLookup, RendezvousClient, RendezvousConfig,
+};
 pub use id::DeviceId;
+pub use kanodesk_proto::v1::NatType;
 pub use kanodesk_proto::v1::RendezvousError;
 pub use record::VerifiedRecord;
 

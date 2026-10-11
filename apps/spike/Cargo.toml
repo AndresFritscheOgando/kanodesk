@@ -23,6 +23,7 @@ kanodesk-proto.workspace = true
 kanodesk-transport.workspace = true
 pollster.workspace = true
 prost.workspace = true
+rpassword.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 wgpu.workspace = true

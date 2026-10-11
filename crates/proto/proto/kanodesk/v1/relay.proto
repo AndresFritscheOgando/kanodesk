@@ -1,0 +1,58 @@
+// Relay server control protocol (03 §6, 16 §4 row 3.4).
+//
+// The relay is blind and TURN-like: it forwards whole QUIC packets between
+// two peers, so TLS and Noise stay end to end. Setup:
+//
+//   1. Each peer opens a QUIC connection to the relay's control port and a
+//      bidirectional stream (StreamHeader kind RELAY), sends RelayBind with
+//      the session token and ticket from the ID server, and gets RelayBound
+//      with the session's data port.
+//   2. Each peer sends small "hello" datagrams from its own UDP socket to
+//      relay_ip:port, so the relay learns the address to forward to (this
+//      works behind symmetric NATs too). Format:
+//        "KDRELAY1" || role (1 byte: 1 controller, 2 host) || session (16 bytes)
+//   3. The controller QUIC-connects to relay_ip:port; the relay forwards
+//      packets between the two learned addresses, within a per-session
+//      bandwidth limit.
+syntax = "proto3";
+
+package kanodesk.v1;
+
+enum RelayRole {
+  RELAY_ROLE_UNSPECIFIED = 0;
+  RELAY_ROLE_CONTROLLER = 1;
+  RELAY_ROLE_HOST = 2;
+}
+
+message RelayBind {
+  // 16 random bytes issued by the ID server (ConnectResult.relay_session).
+  bytes session = 1;
+  // Proof the ID server issued the session (ConnectResult.relay_ticket);
+  // required unless the relay runs in open mode.
+  bytes ticket = 2;
+  RelayRole role = 3;
+}
+
+message RelayBound {
+  // UDP port on the relay for this session's data.
+  uint32 port = 1;
+}
+
+enum RelayError {
+  RELAY_ERROR_UNSPECIFIED = 0;
+  RELAY_ERROR_BAD_TICKET = 1;
+  RELAY_ERROR_FULL = 2;
+  RELAY_ERROR_INVALID_REQUEST = 3;
+}
+
+message RelayFailure {
+  RelayError error = 1;
+}
+
+message RelayMessage {
+  oneof msg {
+    RelayBind bind = 1;
+    RelayBound bound = 2;
+    RelayFailure failure = 3;
+  }
+}

@@ -66,6 +66,8 @@ tokio-tungstenite = "0.30"
 socket2 = "0.6"
 stun-rs = "0.1"
 webrtc-ice = "0.17"
+if-addrs = "0.15"
+igd-next = { version = "0.18", default-features = false, features = ["aio_tokio"] }
 
 # Crypto
 ed25519-dalek = "3.0"
@@ -138,6 +140,7 @@ tracing-appender = "0.2"
 thiserror = "2.0"
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
+rpassword = "7.5"
 
 # Testing
 proptest = "1.12"

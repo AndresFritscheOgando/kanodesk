@@ -3,7 +3,8 @@
 //! ```text
 //! kanodesk-idserver [serve] [--listen 0.0.0.0:21116] [--data-dir DIR]
 //!                   [--relay HOST:PORT]... [--trusted-network CIDR]...
-//!                   [--touch-interval SECONDS]
+//!                   [--touch-interval SECONDS] [--nat-test-listen ADDR | --no-nat-test]
+//!                   [--relay-secret-file PATH]
 //!                   [--per-ip B/S] [--per-device B/S] [--new-ids-per-ip B/S]
 //!                   [--per-target B/S] [--connects-per-target B/S]
 //! kanodesk-idserver list               [--data-dir DIR] [--server ADDR]
@@ -89,6 +90,7 @@ struct Options {
     data_dir: PathBuf,
     server: SocketAddr,
     positionals: Vec<String>,
+    no_nat_test: bool,
 }
 
 fn parse(args: Vec<String>) -> Result<Options, BoxError> {
@@ -97,6 +99,7 @@ fn parse(args: Vec<String>) -> Result<Options, BoxError> {
         data_dir: default_data_dir(),
         server: ([127, 0, 0, 1], DEFAULT_PORT).into(),
         positionals: Vec::new(),
+        no_nat_test: false,
     };
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -108,6 +111,13 @@ fn parse(args: Vec<String>) -> Result<Options, BoxError> {
             "--server" => o.server = value()?.parse()?,
             "--relay" => c.relays.push(value()?),
             "--trusted-network" => c.trusted_networks.push(value()?.parse()?),
+            "--nat-test-listen" => c.nat_test_listen = Some(value()?.parse()?),
+            "--no-nat-test" => o.no_nat_test = true,
+            "--relay-secret-file" => {
+                c.relay_secret = Some(kanodesk_transport::relay::RelaySecret::read_file(
+                    Path::new(&value()?),
+                )?)
+            }
             "--touch-interval" => c.touch_interval = Duration::from_secs_f64(value()?.parse()?),
             "--per-ip" => c.limits.per_ip = value()?.parse()?,
             "--per-device" => c.limits.per_device = value()?.parse()?,
@@ -218,6 +228,15 @@ async fn run() -> Result<(), BoxError> {
             if !o.positionals.is_empty() {
                 return Err(format!("unexpected argument {}", o.positionals[0]).into());
             }
+            // NAT test port: the main port minus one unless set or disabled (03 §4).
+            if o.no_nat_test {
+                o.config.nat_test_listen = None;
+            } else if o.config.nat_test_listen.is_none() {
+                let main = o.config.listen;
+                o.config.nat_test_listen =
+                    Some(SocketAddr::new(main.ip(), main.port().saturating_sub(1)));
+            }
+            let has_secret = o.config.relay_secret.is_some();
             let store = key_store(&o.data_dir)?;
             let (signing, created) = DeviceIdentity::load_or_create(store.as_ref())?;
             let server = start(o.config, signing).await?;
@@ -232,6 +251,13 @@ async fn run() -> Result<(), BoxError> {
             );
             println!("data directory {}", o.data_dir.display());
             println!("{} registered devices", server.device_count());
+            match server.nat_test_addr() {
+                Some(a) => println!("NAT test port {a}"),
+                None => println!("NAT test port disabled"),
+            }
+            if !has_secret {
+                println!("no --relay-secret-file: relays must run with --open");
+            }
             let relays = server.relays();
             if relays.is_empty() {
                 println!("no relay servers configured");

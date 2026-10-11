@@ -1,9 +1,18 @@
 //! `spike-viewer`: connects to `spike-host`, decodes VP9 and renders with wgpu.
 //!
 //! ```text
-//! spike-viewer [--connect 127.0.0.1:9000] [--pin FINGERPRINT | --insecure]
-//!              [--seconds N] [--vsync] [--protocol-version N]
+//! spike-viewer --host-key KEY [--password PASSWORD] [--connect 127.0.0.1:9000]
+//!              [--pin FINGERPRINT] [--data-dir DIR] [--seconds N] [--vsync]
+//!              [--protocol-version N]
 //! ```
+//!
+//! `--host-key` is the device key `spike-host` prints. The viewer logs in
+//! before any video flows: Noise IK (bound to the TLS connection) proves it
+//! reached the device with that key, then SPAKE2 proves it knows the
+//! password (asked for on stdin if `--password` is absent). `--pin` also pins
+//! the TLS certificate; it is optional because the Noise handshake already
+//! authenticates the host. The viewer's own device key is kept in
+//! `--data-dir`.
 //!
 //! `--protocol-version` advertises only that version in `Hello`, to test the
 //! host's handling of incompatible viewers.
@@ -23,12 +32,15 @@ use std::time::{Duration, Instant};
 
 use kanodesk_capture::clock;
 use kanodesk_codec::{Decoder, I420Frame, Vp9Decoder};
-use kanodesk_proto::hello;
+use kanodesk_crypto::{DeviceIdentity, DevicePublicKey};
 use kanodesk_proto::v1::{self, ControlMessage, control_message, video_message};
 use kanodesk_spike::render::SurfaceRenderer;
 use kanodesk_spike::stats::{Samples, ms_between};
-use kanodesk_spike::{DEFAULT_ADDR, spike_hello};
+use kanodesk_spike::{
+    DEFAULT_ADDR, ask_password, default_data_dir, device_identity, key_store, spike_hello,
+};
 use kanodesk_transport::endpoint;
+use kanodesk_transport::session::client_handshake;
 use kanodesk_transport::streams::{self, IncomingStream};
 use kanodesk_transport::tls::{Fingerprint, ServerTrust};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -49,14 +61,27 @@ const WARMUP: Duration = Duration::from_secs(1);
 struct Args {
     addr: SocketAddr,
     trust: ServerTrust,
+    host_key: DevicePublicKey,
+    password: Option<String>,
+    data_dir: std::path::PathBuf,
     seconds: Option<u64>,
     vsync: bool,
     protocol_version: Option<u32>,
 }
 
+/// What the network thread needs to log in.
+struct Login {
+    identity: DeviceIdentity,
+    host_key: DevicePublicKey,
+    password: String,
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut addr: SocketAddr = DEFAULT_ADDR.parse().expect("valid default");
-    let mut trust = None;
+    let mut trust = ServerTrust::InsecureAcceptAny;
+    let mut host_key = None;
+    let mut password = None;
+    let mut data_dir = default_data_dir("spike-viewer");
     let mut seconds = None;
     let mut vsync = false;
     let mut protocol_version = None;
@@ -67,9 +92,13 @@ fn parse_args() -> Result<Args, String> {
             "--connect" => addr = value()?.parse().map_err(|e| format!("--connect: {e}"))?,
             "--pin" => {
                 let fp: Fingerprint = value()?.parse().map_err(|e| format!("--pin: {e}"))?;
-                trust = Some(ServerTrust::Pinned(fp));
+                trust = ServerTrust::Pinned(fp);
             }
-            "--insecure" => trust = Some(ServerTrust::InsecureAcceptAny),
+            "--host-key" => {
+                host_key = Some(value()?.parse().map_err(|e| format!("--host-key: {e}"))?)
+            }
+            "--password" => password = Some(value()?),
+            "--data-dir" => data_dir = value()?.into(),
             "--seconds" => seconds = Some(value()?.parse().map_err(|e| format!("--seconds: {e}"))?),
             "--vsync" => vsync = true,
             "--protocol-version" => {
@@ -82,10 +111,13 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    let trust = trust.ok_or("pass --pin <fingerprint printed by spike-host>, or --insecure")?;
+    let host_key = host_key.ok_or("pass --host-key <device key printed by spike-host>")?;
     Ok(Args {
         addr,
         trust,
+        host_key,
+        password,
+        data_dir,
         seconds,
         vsync,
         protocol_version,
@@ -152,6 +184,13 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let login = match prepare_login(&args) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("spike-viewer: {e}");
+            std::process::exit(1);
+        }
+    };
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(l) => l,
         Err(e) => {
@@ -166,6 +205,7 @@ fn main() {
     let (shutdown, network_thread) = spawn_network(
         args.addr,
         args.trust,
+        login,
         args.protocol_version,
         mailbox.clone(),
         proxy.clone(),
@@ -192,11 +232,28 @@ fn main() {
     std::process::exit(if app.failed { 1 } else { 0 });
 }
 
+/// Loads this viewer's device key and gets the password.
+fn prepare_login(args: &Args) -> Result<Login, BoxError> {
+    let store = key_store(&args.data_dir)?;
+    let identity = device_identity(store.as_ref())?;
+    let password = match &args.password {
+        Some(p) => p.clone(),
+        None => ask_password("password: ")?,
+    };
+    Ok(Login {
+        identity,
+        host_key: args.host_key,
+        password,
+    })
+}
+
 /// Starts the QUIC client (and, once connected, the decoder thread).
 /// Sending on the returned channel closes the connection and ends the thread.
+#[allow(clippy::too_many_arguments)]
 fn spawn_network(
     addr: SocketAddr,
     trust: ServerTrust,
+    login: Login,
     protocol_version: Option<u32>,
     mailbox: Arc<Mailbox>,
     proxy: EventLoopProxy<UserEvent>,
@@ -225,6 +282,7 @@ fn spawn_network(
             let session = network(
                 &client,
                 addr,
+                &login,
                 protocol_version,
                 mailbox,
                 proxy.clone(),
@@ -247,9 +305,11 @@ fn spawn_network(
     (shutdown_tx, thread)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn network(
     client: &kanodesk_transport::Endpoint,
     addr: SocketAddr,
+    login: &Login,
     protocol_version: Option<u32>,
     mailbox: Arc<Mailbox>,
     proxy: EventLoopProxy<UserEvent>,
@@ -259,51 +319,49 @@ async fn network(
     let conn = endpoint::connect(client, addr).await?;
     println!("connected to {addr}");
 
-    let (mut control_send, mut control_recv) = streams::open_control(&conn).await?;
-
-    // Hello exchange and version negotiation (kanodesk_proto::hello).
+    // Login: Noise IK to the expected device key, Hello negotiation, SPAKE2.
     let mut ours = spike_hello();
     if let Some(v) = protocol_version {
         ours.version = v;
         ours.min_version = v;
     }
-    control_send.send(&ours.clone().into()).await?;
-    let theirs = match control_recv.next().await? {
-        Some(ControlMessage {
-            msg: Some(control_message::Msg::Hello(h)),
-        }) => h,
-        other => return Err(format!("expected Hello from host, got {other:?}").into()),
-    };
-    let negotiated = match hello::negotiate(&ours, &theirs) {
-        Ok(n) => n,
-        Err(e) => {
-            // The host sends a Close with its view of the problem; show it.
-            if let Ok(Some(ControlMessage {
-                msg: Some(control_message::Msg::Close(c)),
-            })) = control_recv.next().await
-            {
-                eprintln!("host refused: {:?} {}", c.reason(), c.detail);
-            }
-            return Err(e.into());
-        }
-    };
+    let (mut control, negotiated, kind) = client_handshake(
+        &conn,
+        &login.identity,
+        &login.host_key,
+        &ours,
+        &login.password,
+    )
+    .await?;
     println!(
-        "host agent {:?}: protocol v{}, capabilities {:?}",
-        theirs.agent, negotiated.version, negotiated.capabilities
+        "logged in with the {kind:?} password; host device {} verified; protocol v{}, capabilities {:?}",
+        control.remote(),
+        negotiated.version,
+        negotiated.capabilities
     );
 
-    // Forward the decoder's control messages; report a Close from the host.
+    // Sealed control loop: forward the decoder's messages, report a Close.
     tokio::spawn(async move {
-        while let Some(msg) = control_rx.recv().await {
-            if control_send.send(&msg).await.is_err() {
-                break;
-            }
-        }
-    });
-    tokio::spawn(async move {
-        while let Ok(Some(msg)) = control_recv.next().await {
-            if let Some(control_message::Msg::Close(c)) = msg.msg {
-                eprintln!("host closed the session: {:?} {}", c.reason(), c.detail);
+        loop {
+            tokio::select! {
+                msg = control_rx.recv() => match msg {
+                    Some(msg) => {
+                        if control.send(&msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                msg = control.recv() => match msg {
+                    Ok(Some(ControlMessage {
+                        msg: Some(control_message::Msg::Close(c)),
+                    })) => {
+                        eprintln!("host closed the session: {:?} {}", c.reason(), c.detail);
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                },
             }
         }
     });

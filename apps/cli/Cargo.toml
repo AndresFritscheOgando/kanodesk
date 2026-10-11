@@ -10,8 +10,19 @@ publish.workspace = true
 [[bin]]
 name = "kanodesk-cli"
 path = "src/main.rs"
+# main.rs only dispatches; tests live in the library.
+test = false
 
 [dependencies]
+kanodesk-client.workspace = true
+kanodesk-crypto.workspace = true
+kanodesk-host.workspace = true
+kanodesk-proto.workspace = true
+kanodesk-rendezvous.workspace = true
+kanodesk-transport.workspace = true
+rpassword.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

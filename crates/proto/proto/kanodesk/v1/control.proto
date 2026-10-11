@@ -19,6 +19,7 @@ enum StreamKind {
   STREAM_KIND_VIDEO = 2;
   STREAM_KIND_INPUT = 3;
   STREAM_KIND_RENDEZVOUS = 4;
+  STREAM_KIND_RELAY = 5;
 }
 
 message StreamHeader {
@@ -102,6 +103,9 @@ enum LoginError {
   LOGIN_ERROR_RATE_LIMITED = 2;
   LOGIN_ERROR_DENIED = 3;
   LOGIN_ERROR_TIMEOUT = 4;
+  // The temporary password was right but another login used it first
+  // (a temporary password admits one login); ask for the new one.
+  LOGIN_ERROR_PASSWORD_USED = 5;
 }
 
 message LoginResult {
