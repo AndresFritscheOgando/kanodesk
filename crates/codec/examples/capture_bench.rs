@@ -18,7 +18,7 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(windows)]
 fn main() {
@@ -105,6 +105,7 @@ mod bench {
     use super::*;
     use kanodesk_capture::{Capturer, PlatformCapturer, primary_display};
     use kanodesk_codec::{Encoder, EncoderConfig, I420Frame, Vp9Encoder, convert};
+    use std::time::Instant;
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let args = parse_args()?;

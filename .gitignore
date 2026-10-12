@@ -1,5 +1,6 @@
 # Build output
 /target/
+/dist/
 **/*.rs.bk
 
 # vcpkg manifest-mode install tree

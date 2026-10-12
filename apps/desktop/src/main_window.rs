@@ -11,6 +11,11 @@
 //!   length, permanent password, default permissions, viewer defaults.
 //!   Saved to the config file; the host re-reads it at once.
 //!
+//! On an OS that cannot host ([`crate::server::HOSTING_SUPPORTED`]) the
+//! window is a viewer only: no host is started, "This desk" says so, and
+//! Settings shows only what a viewer uses (ID server and key, viewer
+//! defaults).
+//!
 //! All decisions and texts are in [`crate::main_model`].
 
 use std::sync::{Arc, Mutex};
@@ -25,7 +30,8 @@ use kanodesk_ipc::control::{CONTROL_PROTOCOL, CONTROL_ROLE, HostToUi, UiToHost};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::main_model::{
-    HostLink, MainModel, Page, SettingsForm, ago, approve_text, id_text, link_text, parse_target,
+    HostLink, MainModel, Page, SettingsForm, VIEWER_ONLY_TEXT, ago, approve_text, id_text,
+    link_text, parse_target, viewer_link_text,
 };
 
 /// How often the recent list is re-read (viewers add to it).
@@ -41,7 +47,12 @@ enum Outgoing {
 
 /// Runs the window until it is closed.
 pub fn run() -> Result<(), String> {
-    let model = Arc::new(Mutex::new(MainModel::default()));
+    let hosting = crate::server::HOSTING_SUPPORTED;
+    let model = Arc::new(Mutex::new(if hosting {
+        MainModel::default()
+    } else {
+        MainModel::viewer_only()
+    }));
     let (out, out_rx) = mpsc::unbounded_channel();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -55,7 +66,10 @@ pub fn run() -> Result<(), String> {
         "KanoDesk",
         options,
         Box::new(move |cc| {
-            spawn_ipc(ipc_model, out_rx, cc.egui_ctx.clone());
+            // Without a host there is nobody to talk to; commands are dropped.
+            if hosting {
+                spawn_ipc(ipc_model, out_rx, cc.egui_ctx.clone());
+            }
             Ok(Box::new(MainApp::new(model, out)))
         }),
     )
@@ -238,6 +252,16 @@ impl MainApp {
                 HostLink::Unavailable(e) => {
                     ui.colored_label(ui.visuals().error_fg_color, e);
                 }
+                HostLink::ViewerOnly => {
+                    ui.label(VIEWER_ONLY_TEXT);
+                    ui.add_space(10.0);
+                    let (link, problem) = viewer_link_text(&self.config);
+                    if problem {
+                        ui.colored_label(ui.visuals().warn_fg_color, link);
+                    } else {
+                        ui.weak(link);
+                    }
+                }
                 _ => {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -379,7 +403,7 @@ impl MainApp {
         }
     }
 
-    fn settings(&mut self, ui: &mut egui::Ui) {
+    fn settings(&mut self, ui: &mut egui::Ui, viewer_only: bool) {
         let config = self.config.clone();
         let locked = |key: &str| SettingsForm::locked(&config, key);
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -406,79 +430,8 @@ impl MainApp {
                     );
                     ui.end_row();
                 });
-            ui.add_space(12.0);
-            ui.heading("Security");
-            egui::Grid::new("security")
-                .num_columns(2)
-                .spacing([12.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Incoming connections");
-                    ui.add_enabled_ui(!locked("approve-mode"), |ui| {
-                        egui::ComboBox::from_id_salt("approve")
-                            .selected_text(approve_label(&self.form.approve_mode))
-                            .show_ui(ui, |ui| {
-                                for m in APPROVE_MODES {
-                                    ui.selectable_value(
-                                        &mut self.form.approve_mode,
-                                        (*m).to_owned(),
-                                        approve_label(m),
-                                    );
-                                }
-                            });
-                    });
-                    ui.end_row();
-                    ui.label("One-time password length");
-                    ui.add_enabled(
-                        !locked("temporary-password-length"),
-                        egui::Slider::new(&mut self.form.password_length, 6..=32),
-                    );
-                    ui.end_row();
-                    ui.label("Remote users may use");
-                    ui.horizontal(|ui| {
-                        ui.add_enabled(
-                            !locked("enable-keyboard"),
-                            egui::Checkbox::new(&mut self.form.keyboard, "Keyboard"),
-                        );
-                        ui.add_enabled(
-                            !locked("enable-mouse"),
-                            egui::Checkbox::new(&mut self.form.mouse, "Mouse"),
-                        );
-                    });
-                    ui.end_row();
-                });
-            ui.add_space(8.0);
-            ui.strong("Permanent password");
-            ui.weak("Lets you in without the one-time password (for your own devices).");
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.form.new_password)
-                        .password(true)
-                        .hint_text("new password")
-                        .desired_width(160.0),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.form.confirm_password)
-                        .password(true)
-                        .hint_text("again")
-                        .desired_width(160.0),
-                );
-                if ui.button("Set").clicked() {
-                    match self.form.permanent_password_request() {
-                        Ok(req) => {
-                            self.send(req);
-                            self.form.new_password.clear();
-                            self.form.confirm_password.clear();
-                            self.password_problem = None;
-                        }
-                        Err(e) => self.password_problem = Some(e),
-                    }
-                }
-                if ui.button("Remove").clicked() {
-                    self.send(UiToHost::SetPermanentPassword(None));
-                }
-            });
-            if let Some(p) = &self.password_problem {
-                ui.colored_label(ui.visuals().error_fg_color, p);
+            if !viewer_only {
+                self.host_settings(ui, &locked);
             }
             ui.add_space(12.0);
             ui.heading("Viewer");
@@ -530,6 +483,85 @@ impl MainApp {
         });
     }
 
+    /// The settings only a host uses: approve mode, password length,
+    /// default permissions, permanent password.
+    fn host_settings(&mut self, ui: &mut egui::Ui, locked: &dyn Fn(&str) -> bool) {
+        ui.add_space(12.0);
+        ui.heading("Security");
+        egui::Grid::new("security")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Incoming connections");
+                ui.add_enabled_ui(!locked("approve-mode"), |ui| {
+                    egui::ComboBox::from_id_salt("approve")
+                        .selected_text(approve_label(&self.form.approve_mode))
+                        .show_ui(ui, |ui| {
+                            for m in APPROVE_MODES {
+                                ui.selectable_value(
+                                    &mut self.form.approve_mode,
+                                    (*m).to_owned(),
+                                    approve_label(m),
+                                );
+                            }
+                        });
+                });
+                ui.end_row();
+                ui.label("One-time password length");
+                ui.add_enabled(
+                    !locked("temporary-password-length"),
+                    egui::Slider::new(&mut self.form.password_length, 6..=32),
+                );
+                ui.end_row();
+                ui.label("Remote users may use");
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        !locked("enable-keyboard"),
+                        egui::Checkbox::new(&mut self.form.keyboard, "Keyboard"),
+                    );
+                    ui.add_enabled(
+                        !locked("enable-mouse"),
+                        egui::Checkbox::new(&mut self.form.mouse, "Mouse"),
+                    );
+                });
+                ui.end_row();
+            });
+        ui.add_space(8.0);
+        ui.strong("Permanent password");
+        ui.weak("Lets you in without the one-time password (for your own devices).");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.form.new_password)
+                    .password(true)
+                    .hint_text("new password")
+                    .desired_width(160.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.form.confirm_password)
+                    .password(true)
+                    .hint_text("again")
+                    .desired_width(160.0),
+            );
+            if ui.button("Set").clicked() {
+                match self.form.permanent_password_request() {
+                    Ok(req) => {
+                        self.send(req);
+                        self.form.new_password.clear();
+                        self.form.confirm_password.clear();
+                        self.password_problem = None;
+                    }
+                    Err(e) => self.password_problem = Some(e),
+                }
+            }
+            if ui.button("Remove").clicked() {
+                self.send(UiToHost::SetPermanentPassword(None));
+            }
+        });
+        if let Some(p) = &self.password_problem {
+            ui.colored_label(ui.visuals().error_fg_color, p);
+        }
+    }
+
     fn save_settings(&mut self) {
         let mut config = load_config();
         match self.form.apply(&mut config) {
@@ -537,7 +569,13 @@ impl MainApp {
                 Ok(()) => {
                     self.form_problems.clear();
                     self.config = config;
-                    self.send(UiToHost::ReloadConfig);
+                    let mut model = self.model.lock().expect("not poisoned");
+                    if model.is_viewer_only() {
+                        model.note(true, "Settings saved.", Instant::now());
+                    } else {
+                        drop(model);
+                        self.send(UiToHost::ReloadConfig);
+                    }
                 }
                 Err(e) => self.form_problems = vec![format!("Could not save: {e}")],
             },
@@ -588,6 +626,7 @@ impl eframe::App for MainApp {
             page,
         };
         drop(model);
+        let viewer_only = snapshot.is_viewer_only();
 
         let mut new_page = page;
         egui::Panel::top("tabs").show(ui, |ui| {
@@ -596,9 +635,14 @@ impl eframe::App for MainApp {
                 ui.separator();
                 ui.selectable_value(&mut new_page, Page::Home, "Home");
                 ui.selectable_value(&mut new_page, Page::Settings, "Settings");
-                if let Some(o) = snapshot.overview() {
+                let version = match snapshot.overview() {
+                    Some(o) => Some(o.version.clone()),
+                    None if viewer_only => Some(crate::VERSION.to_owned()),
+                    None => None,
+                };
+                if let Some(v) = version {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak(format!("v{}", o.version));
+                        ui.weak(format!("v{v}"));
                     });
                 }
             });
@@ -619,7 +663,7 @@ impl eframe::App for MainApp {
                     self.remote_desk(&mut cols[1]);
                 });
             }
-            Page::Settings => self.settings(ui),
+            Page::Settings => self.settings(ui, viewer_only),
         });
         if new_page != page {
             if new_page == Page::Settings {

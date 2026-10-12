@@ -24,6 +24,9 @@ pub enum HostLink {
     Connected(Box<HostOverview>),
     /// It could not be started.
     Unavailable(String),
+    /// This OS cannot host ([`crate::server::HOSTING_SUPPORTED`]): the
+    /// window is a viewer only and no host is started or contacted.
+    ViewerOnly,
 }
 
 /// Which page shows.
@@ -61,6 +64,25 @@ impl Default for MainModel {
 }
 
 impl MainModel {
+    /// The model of a window on an OS that cannot host.
+    pub fn viewer_only() -> MainModel {
+        MainModel {
+            host: HostLink::ViewerOnly,
+            ..MainModel::default()
+        }
+    }
+
+    /// Whether this window is a viewer only (no "This desk", no host settings).
+    pub fn is_viewer_only(&self) -> bool {
+        self.host == HostLink::ViewerOnly
+    }
+
+    /// Shows `message` like a reply from the host (for what the window
+    /// does itself, such as saving settings without a host).
+    pub fn note(&mut self, ok: bool, message: &str, now: Instant) {
+        self.reply = Some((ok, message.to_owned(), now));
+    }
+
     /// Applies a message from the host.
     pub fn apply(&mut self, msg: HostToUi, now: Instant) {
         match msg {
@@ -92,6 +114,23 @@ impl MainModel {
             .as_ref()
             .filter(|(_, _, at)| now.duration_since(*at) < REPLY_SHOWN)
             .map(|(ok, m, _)| (*ok, m.as_str()))
+    }
+}
+
+/// What "This desk" says on an OS that cannot host.
+pub const VIEWER_ONLY_TEXT: &str = "This computer can control other desks, but others cannot connect to it: \
+     sharing this screen needs Windows for now.";
+
+/// What "This desk" says on a viewer-only window about the ID server.
+pub fn viewer_link_text(config: &Config) -> (String, bool) {
+    let server = config.text("custom-rendezvous-server");
+    if server.is_empty() || config.text("key").is_empty() {
+        (
+            "No ID server set: open Settings to set one before connecting".to_owned(),
+            true,
+        )
+    } else {
+        (format!("ID server: {server}"), false)
     }
 }
 
@@ -304,6 +343,32 @@ mod tests {
         m.host = HostLink::Unavailable("x".into());
         m.disconnected();
         assert!(matches!(m.host, HostLink::Unavailable(_)));
+        assert!(!m.is_viewer_only());
+    }
+
+    #[test]
+    fn viewer_only() {
+        let mut m = MainModel::viewer_only();
+        let t0 = Instant::now();
+        assert!(m.is_viewer_only() && m.overview().is_none());
+        assert_eq!(m.page, Page::Home);
+        m.disconnected();
+        assert!(m.is_viewer_only(), "nothing to lose");
+        m.note(true, "Settings saved.", t0);
+        assert_eq!(m.current_reply(t0), Some((true, "Settings saved.")));
+        assert!(VIEWER_ONLY_TEXT.contains("Windows"));
+        assert!(!VIEWER_ONLY_TEXT.contains("  "), "one space between words");
+
+        let mut config = Config::in_memory();
+        let (text, problem) = viewer_link_text(&config);
+        assert!(problem && text.contains("Settings"), "{text}");
+        config.set("custom-rendezvous-server", "10.0.0.31").unwrap();
+        assert!(viewer_link_text(&config).1, "the key is missing");
+        config.set("key", KEY).unwrap();
+        assert_eq!(
+            viewer_link_text(&config),
+            ("ID server: 10.0.0.31".to_owned(), false)
+        );
     }
 
     #[test]

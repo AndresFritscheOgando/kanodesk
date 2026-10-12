@@ -1,0 +1,4 @@
+# Shell scripts and the Docker build file run on Linux: keep LF line endings
+# even in a Windows checkout with core.autocrlf.
+*.sh text eol=lf
+Dockerfile text eol=lf

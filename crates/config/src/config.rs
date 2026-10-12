@@ -365,6 +365,7 @@ mod tests {
     fn default_location_is_per_user() {
         let p = default_path().unwrap();
         assert!(p.ends_with(FILE_NAME));
-        assert!(p.to_string_lossy().contains("KanoDesk"));
+        // "KanoDesk" on Windows and macOS, "kanodesk" on Linux (XDG).
+        assert!(p.to_string_lossy().to_lowercase().contains("kanodesk"));
     }
 }

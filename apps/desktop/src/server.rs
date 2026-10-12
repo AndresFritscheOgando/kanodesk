@@ -25,6 +25,15 @@
 
 use std::path::PathBuf;
 
+/// Whether this OS can host: the host needs a screen-capture and an input
+/// backend, and only Windows has them so far. Elsewhere `kanodesk` is a
+/// viewer only and never starts `--server`.
+pub const HOSTING_SUPPORTED: bool = cfg!(windows);
+
+/// Why [`HOSTING_SUPPORTED`] is `false`.
+pub const HOSTING_UNSUPPORTED: &str =
+    "the host needs a screen-capture backend; only Windows has one so far";
+
 /// Parsed `--server` arguments.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerArgs {
@@ -266,7 +275,7 @@ fn launch_cm() -> std::io::Result<()> {
 /// The host process needs a capture backend; only Windows has one so far.
 #[cfg(not(windows))]
 pub fn run(_args: ServerArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Err("the host needs a capture backend; only Windows has one so far".into())
+    Err(HOSTING_UNSUPPORTED.into())
 }
 
 #[cfg(test)]

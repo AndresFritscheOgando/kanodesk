@@ -47,3 +47,34 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+  linux:
+    name: fmt, clippy, test (linux, viewer + servers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build tools for libvpx
+        run: sudo apt-get update && sudo apt-get install -y nasm pkg-config
+
+      # Same vcpkg.json as Windows, triplet x64-linux (static libvpx 1.13.1).
+      - name: Cache vcpkg libraries
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_installed
+          key: vcpkg-${{ runner.os }}-x64-linux-${{ hashFiles('vcpkg.json') }}
+
+      - name: Fetch vcpkg
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/microsoft/vcpkg "$RUNNER_TEMP/vcpkg"
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+
+      - name: fmt, clippy, test
+        run: VCPKG_ROOT="$RUNNER_TEMP/vcpkg" packaging/linux/build.sh check

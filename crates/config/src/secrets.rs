@@ -49,7 +49,8 @@ mod tests {
             default_data_dir()
                 .unwrap()
                 .to_string_lossy()
-                .contains("KanoDesk")
+                .to_lowercase()
+                .contains("kanodesk")
         );
     }
 }

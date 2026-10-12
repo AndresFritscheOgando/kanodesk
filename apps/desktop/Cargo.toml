@@ -33,5 +33,13 @@ tracing-subscriber.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 
+# Linux: X11 and Wayland for the windows (eframe's glutin needs GLX/EGL), the
+# clipboard and egui-wgpu's winit glue. All of them are loaded with dlopen at
+# run time, so building needs no -dev packages.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { workspace = true, features = ["x11", "wayland"] }
+egui-wgpu = { workspace = true, features = ["x11", "wayland"] }
+egui-winit = { workspace = true, features = ["x11", "wayland"] }
+
 [lints]
 workspace = true

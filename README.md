@@ -33,7 +33,7 @@ Status: early scaffold. See [PROGRESS.md](PROGRESS.md) for what works and what's
 
 ## Build
 
-Windows 10/11 x64 is the first target. The toolchain is pinned to stable by `rust-toolchain.toml`.
+Windows 10/11 x64 is the first target; Linux x86_64 builds the viewer and the servers (see [Linux (viewer)](#linux-viewer)). The toolchain is pinned to stable by `rust-toolchain.toml`.
 
 Prerequisites:
 
@@ -71,6 +71,46 @@ Tests that need a real interactive desktop (DXGI capture) are `#[ignore]`d becau
 ```bash
 cargo test -p kanodesk-capture -- --ignored
 ```
+
+### Linux (viewer)
+
+On Linux, `kanodesk` is a **viewer only**: it controls other desks (Windows hosts) by ID, but cannot be controlled, because there is no Linux screen-capture or input backend yet. The main window shows the connect box, recent sessions and the settings a viewer uses (ID server, key, viewer defaults), and never starts a host. The ID server and relay work fully on Linux.
+
+**Ready-made tarball.** `packaging/linux/build.sh package` produces `dist/kanodesk-<version>-linux-x86_64.tar.gz` (`kanodesk`, `kanodesk-idserver`, `kanodesk-relay`, `QUICKSTART.md`, licences). Build it in the Debian 12 image so it runs on any distribution with glibc 2.36 or newer (Debian 12/13, Ubuntu 22.04+); from Windows with Docker Desktop, in the repo root:
+
+```bash
+docker build -t kanodesk-linux-build packaging/linux
+```
+
+```bash
+docker run --rm -v "${PWD}:/src" -v kd-target:/build/target -v kd-vcpkg:/build/vcpkg_installed -e CARGO_TARGET_DIR=/build/target -e VCPKG_INSTALL_ROOT=/build/vcpkg_installed -w /src kanodesk-linux-build bash packaging/linux/build.sh package
+```
+
+(`VCPKG_INSTALL_ROOT` keeps the Linux libvpx out of the shared `vcpkg_installed/`, where a manifest-mode install would remove the Windows one. `build.sh check` runs fmt, clippy and the tests in the same image.)
+
+**Building on Debian/Ubuntu directly** (Debian 12 or newer):
+
+```bash
+sudo apt install build-essential pkg-config nasm curl zip unzip tar git
+```
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+```bash
+git clone https://github.com/microsoft/vcpkg ~/vcpkg && ~/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+```
+
+Then, in the repo, with `VCPKG_ROOT=~/vcpkg`: `packaging/linux/build.sh env` builds libvpx 1.13.1 from `vcpkg.json` (triplet `x64-linux`, static, under a minute) and prints the variables to export; export them (`eval "$(VCPKG_ROOT=~/vcpkg packaging/linux/build.sh env)"`) and build as usual:
+
+```bash
+cargo build --release -p kanodesk-desktop
+```
+
+`.cargo/config.toml` points libvpx at the Windows tree, which Cargo cannot make target-specific; the exported variables win, and `crates/codec/build.rs` stops with this hint when they are missing (rather than linking a system libvpx whose ABI may not match the bindings). No X11, Wayland or GL `-dev` packages are needed: winit, glutin and wgpu load those libraries at run time. A desktop install has them; on a minimal one see `packaging/linux/QUICKSTART.md`.
+
+**Differences from Windows.** The viewer cannot grab the keyboard on Linux, so **system keys stay local**: Super, Alt+Tab, Alt+F4 and other shortcuts your desktop environment handles act on the Linux machine, not on the remote one (Ctrl+Alt+End still sends Ctrl+Alt+Del). Config is in `~/.config/kanodesk/`, the viewer's key and logs in `~/.local/share/kanodesk/`. Tests that need Windows (DXGI, `SendInput`, the keyboard hook, named pipes) are compiled only there; the host end-to-end tests run on every OS because they use test capture and input backends.
 
 ### ID server
 
@@ -234,7 +274,7 @@ The viewer window shows the host's primary display with a frame counter and late
 
 Once logged in, the viewer controls the host's mouse and keyboard while its window has focus: clicks, drags, the wheel and keys (by physical position, so the host's keyboard layout decides the characters). Everything held is released when the viewer loses focus or closes, and the host also releases a viewer's keys if it goes quiet for 3 s or disconnects. On the host, `--view-only` starts with input refused; pressing Enter in the host's console toggles between view only and full control (the viewer's overlay shows `VIEW ONLY`).
 
-The viewer's own shortcuts (not sent to the host): **Ctrl+Alt+End** sends Ctrl+Alt+Del (the host performs it once the Windows service exists; until then it reports that it cannot); **Ctrl+Alt+Shift+M** toggles relative mouse (the pointer is locked to the window and raw motion is sent, for games); **Ctrl+Alt+Shift+K** toggles Translate mode, which types characters as your own keyboard layout produces them (useful when the two machines use different layouts; system keys then stay local). In the default Map mode the viewer grabs the keyboard while it has focus, so Win, Alt+Tab, Alt+F4 and Ctrl+Esc go to the host; Ctrl+Alt+Del and Win+L always stay local (Windows handles them below any program). Caps/Num/Scroll Lock act on your machine and the host follows their states. Media keys (volume, play/pause, browser keys) are forwarded.
+The viewer's own shortcuts (not sent to the host): **Ctrl+Alt+End** sends Ctrl+Alt+Del (the host performs it once the Windows service exists; until then it reports that it cannot); **Ctrl+Alt+Shift+M** toggles relative mouse (the pointer is locked to the window and raw motion is sent, for games); **Ctrl+Alt+Shift+K** toggles Translate mode, which types characters as your own keyboard layout produces them (useful when the two machines use different layouts; system keys then stay local). In the default Map mode the viewer grabs the keyboard while it has focus (on Windows; on Linux system keys stay local), so Win, Alt+Tab, Alt+F4 and Ctrl+Esc go to the host; Ctrl+Alt+Del and Win+L always stay local (Windows handles them below any program). Caps/Num/Scroll Lock act on your machine and the host follows their states. Media keys (volume, play/pause, browser keys) are forwarded.
 
 The host's pointer is shown: while you control, your pointer over the window takes the host's shape; in view-only and relative mode the host's pointer is drawn into the picture. (Windows reports the pointer when it moves, so it appears after the first movement on the host.)
 

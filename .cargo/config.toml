@@ -1,6 +1,12 @@
 # Native libraries come from vcpkg in manifest mode (see vcpkg.json and README):
 #   vcpkg install --triplet x64-windows-static-md
 # which installs into ./vcpkg_installed/.
+#
+# Linux: `[env]` cannot depend on the target, so these values are for
+# Windows. On Linux, export the libvpx variables printed by
+# `packaging/linux/build.sh env` (vcpkg's x64-linux libvpx, linked
+# statically); variables set in the environment win over `[env]`.
+# crates/codec/build.rs stops the build with that hint if they are missing.
 
 [env]
 # env-libvpx-sys ships pregenerated bindings up to 1.13.0; vcpkg.json pins
