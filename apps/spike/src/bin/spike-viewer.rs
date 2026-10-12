@@ -1,7 +1,7 @@
 //! `spike-viewer`: connects to `spike-host`, decodes VP9 and renders with wgpu.
 //!
 //! ```text
-//! spike-viewer --host-key KEY [--password PASSWORD] [--connect 127.0.0.1:9000]
+//! spike-viewer --host-key KEY [--password PASSWORD | --ask-host] [--connect 127.0.0.1:9000]
 //!              [--pin FINGERPRINT] [--data-dir DIR] [--seconds N] [--vsync]
 //!              [--protocol-version N]
 //! ```
@@ -9,7 +9,8 @@
 //! `--host-key` is the device key `spike-host` prints. The viewer logs in
 //! before any video flows: Noise IK (bound to the TLS connection) proves it
 //! reached the device with that key, then SPAKE2 proves it knows the
-//! password (asked for on stdin if `--password` is absent). `--pin` also pins
+//! password (asked for on stdin if `--password` is absent), or with
+//! `--ask-host` that the host's user accepts it instead. `--pin` also pins
 //! the TLS certificate; it is optional because the Noise handshake already
 //! authenticates the host. The viewer's own device key is kept in
 //! `--data-dir`.
@@ -68,7 +69,7 @@ use kanodesk_spike::{
     DEFAULT_ADDR, ask_password, default_data_dir, device_identity, key_store, spike_hello,
 };
 use kanodesk_transport::endpoint;
-use kanodesk_transport::session::client_handshake;
+use kanodesk_transport::session::{Credentials, client_handshake};
 use kanodesk_transport::streams::{self, IncomingStream};
 use kanodesk_transport::tls::{Fingerprint, ServerTrust};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -91,6 +92,7 @@ struct Args {
     trust: ServerTrust,
     host_key: DevicePublicKey,
     password: Option<String>,
+    ask_host: bool,
     data_dir: std::path::PathBuf,
     seconds: Option<u64>,
     vsync: bool,
@@ -101,7 +103,8 @@ struct Args {
 struct Login {
     identity: DeviceIdentity,
     host_key: DevicePublicKey,
-    password: String,
+    /// `None`: ask the host's user instead.
+    password: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -109,6 +112,7 @@ fn parse_args() -> Result<Args, String> {
     let mut trust = ServerTrust::InsecureAcceptAny;
     let mut host_key = None;
     let mut password = None;
+    let mut ask_host = false;
     let mut data_dir = default_data_dir("spike-viewer");
     let mut seconds = None;
     let mut vsync = false;
@@ -126,6 +130,7 @@ fn parse_args() -> Result<Args, String> {
                 host_key = Some(value()?.parse().map_err(|e| format!("--host-key: {e}"))?)
             }
             "--password" => password = Some(value()?),
+            "--ask-host" => ask_host = true,
             "--data-dir" => data_dir = value()?.into(),
             "--seconds" => seconds = Some(value()?.parse().map_err(|e| format!("--seconds: {e}"))?),
             "--vsync" => vsync = true,
@@ -140,11 +145,15 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     let host_key = host_key.ok_or("pass --host-key <device key printed by spike-host>")?;
+    if ask_host && password.is_some() {
+        return Err("--ask-host and --password exclude each other".into());
+    }
     Ok(Args {
         addr,
         trust,
         host_key,
         password,
+        ask_host,
         data_dir,
         seconds,
         vsync,
@@ -287,9 +296,10 @@ fn main() {
 fn prepare_login(args: &Args) -> Result<Login, BoxError> {
     let store = key_store(&args.data_dir)?;
     let identity = device_identity(store.as_ref())?;
-    let password = match &args.password {
-        Some(p) => p.clone(),
-        None => ask_password("password: ")?,
+    let password = match (&args.password, args.ask_host) {
+        (Some(p), _) => Some(p.clone()),
+        (None, true) => None,
+        (None, false) => Some(ask_password("password: ")?),
     };
     Ok(Login {
         identity,
@@ -393,11 +403,19 @@ async fn network(
         &login.identity,
         &login.host_key,
         &ours,
-        &login.password,
+        match &login.password {
+            Some(p) => Credentials::Password(p),
+            None => Credentials::AskHost,
+        },
+        &mut || println!("waiting for the host's user to accept..."),
     )
     .await?;
+    let how = match kind {
+        Some(kind) => format!("the {kind:?} password"),
+        None => "the host user's approval".to_owned(),
+    };
     println!(
-        "logged in with the {kind:?} password; host device {} verified; protocol v{}, capabilities {:?}",
+        "logged in with {how}; host device {} verified; protocol v{}, capabilities {:?}",
         control.remote(),
         negotiated.version,
         negotiated.capabilities
@@ -463,7 +481,17 @@ async fn network(
         .name("decoder".into())
         .spawn(move || decode_loop(display, frames_rx, mailbox, proxy, control_tx))?;
 
-    while let Some(msg) = reader.next().await? {
+    loop {
+        let msg = match reader.next().await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break,
+            Err(e) => {
+                return Err(match endpoint::peer_close_message(&conn) {
+                    Some(why) => format!("the host ended the session: {why}").into(),
+                    None => e.into(),
+                });
+            }
+        };
         let received_us = clock::now_us();
         match msg.msg {
             Some(video_message::Msg::StreamStart(start)) => println!(

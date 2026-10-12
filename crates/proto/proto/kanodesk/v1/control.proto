@@ -79,10 +79,16 @@ message Sealed {
 }
 
 // Client to host: one SPAKE2 message per password slot, in slot order
-// [temporary, permanent].
+// [temporary, permanent]. No messages means "no password: ask the host's
+// user to accept" (click approval).
 message AuthStart {
   repeated bytes spake2_messages = 1;
+  // Who is connecting, shown to the host's user.
+  PeerInfo client = 2;
 }
+
+// Host to client: the login is waiting for the host's user to accept it.
+message LoginPending {}
 
 // Host to client: the host's SPAKE2 message for each slot.
 message AuthFinish {
@@ -112,6 +118,8 @@ enum LoginError {
   // The temporary password was right but another login used it first
   // (a temporary password admits one login); ask for the new one.
   LOGIN_ERROR_PASSWORD_USED = 5;
+  // This host accepts only password logins and none was offered.
+  LOGIN_ERROR_PASSWORD_REQUIRED = 6;
 }
 
 message LoginResult {
@@ -183,5 +191,6 @@ message ControlMessage {
     NoiseHandshake noise_handshake = 14;
     Sealed sealed = 15;
     AuthConfirm auth_confirm = 16;
+    LoginPending login_pending = 17;
   }
 }

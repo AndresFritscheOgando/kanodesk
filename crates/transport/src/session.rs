@@ -2,9 +2,14 @@
 //! TLS session, then every control message sealed, then `Hello` and SPAKE2
 //! login (see `control.proto` for the order).
 //!
-//! [`client_handshake`] / [`host_handshake`] run it on a QUIC connection;
-//! [`client_session`] / [`host_session`] are generic over the byte streams
-//! so the whole flow is testable in memory.
+//! Logins are by password (SPAKE2), by the host's user clicking "accept"
+//! (the viewer sends no password; the host says it is waiting with
+//! `LoginPending`), or both. [`host_authenticate`] stops before the decision
+//! and returns a [`PendingLogin`] for the caller to accept or reject.
+//!
+//! [`client_handshake`] / [`host_login`] / [`host_handshake`] run it on a QUIC
+//! connection; [`client_session`] / [`host_authenticate`] / [`host_session`]
+//! are generic over the byte streams so the whole flow is testable in memory.
 
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -163,8 +168,25 @@ async fn exchange_hello<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 }
 
+/// A client login: the sealed control stream, the agreed protocol, and the
+/// password slot that matched (`None`: the host's user accepted it).
+pub type ClientLoginResult<R, W> =
+    Result<(SecureControl<R, W>, Negotiated, Option<PasswordKind>), SessionError>;
+
+/// How a viewer logs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credentials<'a> {
+    /// With the host's temporary or permanent password (SPAKE2).
+    Password(&'a str),
+    /// Without a password: the host's user accepts or denies (click approval).
+    AskHost,
+}
+
 /// Client side: Noise handshake to the host with device key `host_key`,
-/// `Hello`, then SPAKE2 login with `password`.
+/// `Hello`, then the login with `credentials`. `on_pending` runs whenever
+/// the host says the login waits for its user's approval. Returns the
+/// password slot that matched, or `None` if the host's user accepted the
+/// login without a password.
 #[allow(clippy::too_many_arguments)]
 pub async fn client_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut reader: MessageReader<R, ControlMessage>,
@@ -173,8 +195,9 @@ pub async fn client_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     host_key: &DevicePublicKey,
     channel_binding: &[u8],
     ours: &Hello,
-    password: &str,
-) -> Result<(SecureControl<R, W>, Negotiated, PasswordKind), SessionError> {
+    credentials: Credentials<'_>,
+    on_pending: &mut (dyn FnMut() + Send),
+) -> ClientLoginResult<R, W> {
     let (initiator, msg1) = Initiator::start(identity, host_key, channel_binding)?;
     writer
         .send(&v1::NoiseHandshake { message: msg1 }.into())
@@ -194,39 +217,75 @@ pub async fn client_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let negotiated = exchange_hello(&mut control, ours, true).await?;
 
     let hash = *control.channel.handshake_hash();
-    let (login, start) = ClientLogin::start(password, &hash);
+    let (login, start) = match credentials {
+        Credentials::Password(password) => {
+            let (login, start) = ClientLogin::start(password, &hash);
+            (Some(login), start)
+        }
+        Credentials::AskHost => (None, Vec::new()),
+    };
     send_or_rejection(
         &mut control,
         &v1::AuthStart {
             spake2_messages: start,
+            client: Some(local_peer_info(&ours.agent, &[])),
         }
         .into(),
     )
     .await?;
-    let finish = match control.expect().await? {
-        Msg::AuthFinish(f) => f.spake2_messages,
-        Msg::LoginResult(r) => return Err(rejection(&r)),
-        other => return Err(unexpected("AuthFinish", &other)),
-    };
-    let (confirmed, macs) = login.respond(&finish)?;
-    send_or_rejection(
-        &mut control,
-        &v1::AuthConfirm {
-            confirmations: macs,
+
+    let mut confirmed = None;
+    if let Some(login) = login {
+        // A click-only host answers with the result directly (the password
+        // is not used); otherwise the SPAKE2 exchange continues.
+        let finish = loop {
+            match control.expect().await? {
+                Msg::AuthFinish(f) => break Some(f.spake2_messages),
+                Msg::LoginPending(_) => on_pending(),
+                Msg::LoginResult(r) => return finish_login(control, negotiated, &r, None),
+                other => return Err(unexpected("AuthFinish", &other)),
+            }
+        };
+        if let Some(finish) = finish {
+            let (c, macs) = login.respond(&finish)?;
+            send_or_rejection(
+                &mut control,
+                &v1::AuthConfirm {
+                    confirmations: macs,
+                }
+                .into(),
+            )
+            .await?;
+            confirmed = Some(c);
         }
-        .into(),
-    )
-    .await?;
-    let result = match control.expect().await? {
-        Msg::LoginResult(r) => r,
-        other => return Err(unexpected("LoginResult", &other)),
+    }
+    let result = loop {
+        match control.expect().await? {
+            Msg::LoginPending(_) => on_pending(),
+            Msg::LoginResult(r) => break r,
+            other => return Err(unexpected("LoginResult", &other)),
+        }
     };
+    finish_login(control, negotiated, &result, confirmed)
+}
+
+/// Checks the final `LoginResult`: success needs the host's key
+/// confirmation when a password was used.
+fn finish_login<R, W>(
+    control: SecureControl<R, W>,
+    negotiated: Negotiated,
+    result: &v1::LoginResult,
+    confirmed: Option<kanodesk_crypto::login::ClientConfirmed>,
+) -> ClientLoginResult<R, W> {
     match result.result {
         Some(login_result::Result::PeerInfo(_)) => {
-            let kind = confirmed.verify_host(&result.confirmation)?;
+            let kind = match confirmed {
+                Some(c) => Some(c.verify_host(&result.confirmation)?),
+                None => None,
+            };
             Ok((control, negotiated, kind))
         }
-        _ => Err(rejection(&result)),
+        _ => Err(rejection(result)),
     }
 }
 
@@ -274,27 +333,125 @@ pub struct HostAuth<'a> {
     pub peer_info: v1::PeerInfo,
 }
 
-/// A viewer that passed the handshake and the password check.
+/// A logged-in viewer.
 pub struct HostSession<R, W> {
     /// The sealed control stream.
     pub control: SecureControl<R, W>,
     /// Agreed protocol version and capabilities.
     pub negotiated: Negotiated,
-    /// Which password the viewer used. After a temporary-password login,
-    /// the temporary password has already been replaced.
-    pub password: PasswordKind,
+    /// Which password the viewer used (`None`: accepted by the host's user
+    /// without one). After a temporary-password login, the temporary
+    /// password has already been replaced.
+    pub password: Option<PasswordKind>,
 }
 
-/// Host side: answers the Noise handshake, `Hello`, and the login. Sends the
-/// `LoginResult` either way. Only a successful return may lead to video.
-pub async fn host_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+/// A viewer that passed the handshake and, if required, the password check,
+/// and now waits for the host's decision: [`PendingLogin::accept`] or
+/// [`PendingLogin::reject`]. Nothing but control messages has been exchanged.
+pub struct PendingLogin<R, W> {
+    control: SecureControl<R, W>,
+    negotiated: Negotiated,
+    password: Option<PasswordKind>,
+    client: v1::PeerInfo,
+    confirmation: Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> PendingLogin<R, W> {
+    /// The viewer's authenticated device key.
+    pub fn remote(&self) -> &DevicePublicKey {
+        self.control.remote()
+    }
+
+    /// What the viewer says about itself (host name, user, platform, agent).
+    pub fn client(&self) -> &v1::PeerInfo {
+        &self.client
+    }
+
+    /// The password slot that matched, if a password was checked.
+    pub fn password(&self) -> Option<PasswordKind> {
+        self.password
+    }
+
+    /// Agreed protocol version and capabilities.
+    pub fn negotiated(&self) -> &Negotiated {
+        &self.negotiated
+    }
+
+    /// Tells the viewer that the host's user is being asked.
+    pub async fn notify_pending(&mut self) -> Result<(), SessionError> {
+        self.control.send(&v1::LoginPending {}.into()).await
+    }
+
+    /// Resolves when the viewer gives up (closes the control stream or the
+    /// connection) while waiting. Cancel-safe.
+    pub async fn closed(&mut self) {
+        while let Ok(Some(_)) = self.control.recv().await {}
+    }
+
+    /// Lets the viewer in.
+    pub async fn accept(
+        mut self,
+        peer_info: v1::PeerInfo,
+    ) -> Result<HostSession<R, W>, SessionError> {
+        let result = v1::LoginResult {
+            result: Some(login_result::Result::PeerInfo(peer_info)),
+            retry_after_ms: 0,
+            confirmation: std::mem::take(&mut self.confirmation),
+        };
+        self.control.send(&result.into()).await?;
+        Ok(HostSession {
+            control: self.control,
+            negotiated: self.negotiated,
+            password: self.password,
+        })
+    }
+
+    /// Turns the viewer away with `error` (for example `Denied` or `Timeout`).
+    pub async fn reject(mut self, error: LoginError) -> Result<(), SessionError> {
+        let result = v1::LoginResult {
+            result: Some(login_result::Result::Error(error as i32)),
+            retry_after_ms: 0,
+            confirmation: Vec::new(),
+        };
+        self.control.send(&result.into()).await
+    }
+}
+
+async fn refuse<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    control: &mut SecureControl<R, W>,
+    error: LoginError,
+    retry_after: Option<Duration>,
+    rotated_temporary: bool,
+) -> SessionError {
+    let result = v1::LoginResult {
+        result: Some(login_result::Result::Error(error as i32)),
+        retry_after_ms: retry_after.map_or(0, |d| d.as_millis().min(u32::MAX as u128) as u32),
+        confirmation: Vec::new(),
+    };
+    if let Err(e) = control.send(&result.into()).await {
+        return e;
+    }
+    SessionError::Rejected {
+        error,
+        retry_after,
+        rotated_temporary,
+    }
+}
+
+/// Host side, first step: answers the Noise handshake and `Hello`, then the
+/// login. With `require_password`, the viewer must prove a password (and a
+/// viewer offering none is refused with `PasswordRequired`); without it, any
+/// password is ignored and the caller decides (click approval). Refusals are
+/// sent to the viewer here; a [`PendingLogin`] still needs `accept` or `reject`.
+pub async fn host_authenticate<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut reader: MessageReader<R, ControlMessage>,
     mut writer: MessageWriter<W, ControlMessage>,
     auth: &HostAuth<'_>,
     channel_binding: &[u8],
     ours: &Hello,
     peer: IpAddr,
-) -> Result<HostSession<R, W>, SessionError> {
+    require_password: bool,
+) -> Result<PendingLogin<R, W>, SessionError> {
     let msg1 = match reader.next().await?.and_then(|m| m.msg) {
         Some(Msg::NoiseHandshake(h)) => h.message,
         Some(other) => return Err(unexpected("NoiseHandshake", &other)),
@@ -312,7 +469,7 @@ pub async fn host_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     let negotiated = exchange_hello(&mut control, ours, false).await?;
 
-    // Throttled peers get no SPAKE2 exchange at all.
+    // Throttled peers get no login exchange (and no approval prompt) at all.
     let throttled = auth
         .throttle
         .lock()
@@ -323,23 +480,25 @@ pub async fn host_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             Throttled::RetryAfter(d) => (LoginError::RateLimited, Some(d)),
             Throttled::Banned => (LoginError::Denied, None),
         };
-        let result = v1::LoginResult {
-            result: Some(login_result::Result::Error(error as i32)),
-            retry_after_ms: retry_after.map_or(0, |d| d.as_millis().min(u32::MAX as u128) as u32),
-            confirmation: Vec::new(),
-        };
-        control.send(&result.into()).await?;
-        return Err(SessionError::Rejected {
-            error,
-            retry_after,
-            rotated_temporary: false,
-        });
+        return Err(refuse(&mut control, error, retry_after, false).await);
     }
 
-    let start = match control.expect().await? {
-        Msg::AuthStart(s) => s.spake2_messages,
+    let (start, client) = match control.expect().await? {
+        Msg::AuthStart(s) => (s.spake2_messages, s.client.unwrap_or_default()),
         other => return Err(unexpected("AuthStart", &other)),
     };
+    if !require_password {
+        return Ok(PendingLogin {
+            control,
+            negotiated,
+            password: None,
+            client,
+            confirmation: Vec::new(),
+        });
+    }
+    if start.is_empty() {
+        return Err(refuse(&mut control, LoginError::PasswordRequired, None, false).await);
+    }
     let hash = *control.channel.handshake_hash();
     let (login, finish, generation) = {
         let passwords = auth.passwords.lock().expect("not poisoned");
@@ -375,33 +534,19 @@ pub async fn host_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     valid
                 };
                 if !still_valid {
-                    let result = v1::LoginResult {
-                        result: Some(login_result::Result::Error(LoginError::PasswordUsed as i32)),
-                        retry_after_ms: 0,
-                        confirmation: Vec::new(),
-                    };
-                    control.send(&result.into()).await?;
-                    return Err(SessionError::Rejected {
-                        error: LoginError::PasswordUsed,
-                        retry_after: None,
-                        rotated_temporary: false,
-                    });
+                    return Err(refuse(&mut control, LoginError::PasswordUsed, None, false).await);
                 }
             }
             auth.throttle
                 .lock()
                 .expect("not poisoned")
                 .record_success(&peer);
-            let result = v1::LoginResult {
-                result: Some(login_result::Result::PeerInfo(auth.peer_info.clone())),
-                retry_after_ms: 0,
-                confirmation: host_mac,
-            };
-            control.send(&result.into()).await?;
-            Ok(HostSession {
+            Ok(PendingLogin {
                 control,
                 negotiated,
-                password: kind,
+                password: Some(kind),
+                client,
+                confirmation: host_mac,
             })
         }
         Err(_) => {
@@ -416,21 +561,32 @@ pub async fn host_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     .expect("not poisoned")
                     .rotate_temporary()?;
             }
-            let result = v1::LoginResult {
-                result: Some(login_result::Result::Error(
-                    LoginError::WrongPassword as i32,
-                )),
-                retry_after_ms: 0,
-                confirmation: Vec::new(),
-            };
-            control.send(&result.into()).await?;
-            Err(SessionError::Rejected {
-                error: LoginError::WrongPassword,
-                retry_after: None,
-                rotated_temporary: outcome.rotate_temporary,
-            })
+            Err(refuse(
+                &mut control,
+                LoginError::WrongPassword,
+                None,
+                outcome.rotate_temporary,
+            )
+            .await)
         }
     }
+}
+
+/// Host side, password only: [`host_authenticate`] with a required password,
+/// then accept. Sends the `LoginResult` either way; only a successful return
+/// may lead to video.
+pub async fn host_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: MessageReader<R, ControlMessage>,
+    writer: MessageWriter<W, ControlMessage>,
+    auth: &HostAuth<'_>,
+    channel_binding: &[u8],
+    ours: &Hello,
+    peer: IpAddr,
+) -> Result<HostSession<R, W>, SessionError> {
+    host_authenticate(reader, writer, auth, channel_binding, ours, peer, true)
+        .await?
+        .accept(auth.peer_info.clone())
+        .await
 }
 
 /// A basic `PeerInfo` for this machine with the given agent string.
@@ -458,37 +614,56 @@ pub async fn client_handshake(
     identity: &DeviceIdentity,
     host_key: &DevicePublicKey,
     ours: &Hello,
-    password: &str,
-) -> Result<
-    (
-        SecureControl<quinn::RecvStream, quinn::SendStream>,
-        Negotiated,
-        PasswordKind,
-    ),
-    SessionError,
-> {
+    credentials: Credentials<'_>,
+    on_pending: &mut (dyn FnMut() + Send),
+) -> ClientLoginResult<quinn::RecvStream, quinn::SendStream> {
     let binding = crate::endpoint::channel_binding(conn)
         .map_err(|e| SessionError::Protocol(e.to_string()))?;
     let (writer, reader) = crate::streams::open_control(conn)
         .await
         .map_err(|e| SessionError::Protocol(e.to_string()))?;
-    client_session(reader, writer, identity, host_key, &binding, ours, password).await
+    client_session(
+        reader,
+        writer,
+        identity,
+        host_key,
+        &binding,
+        ours,
+        credentials,
+        on_pending,
+    )
+    .await
 }
 
-/// Host side on a QUIC connection: accepts the control stream and runs
-/// [`host_session`]. Throttling is keyed by the peer's IP (canonical form).
-pub async fn host_handshake(
+/// Host side on a QUIC connection, first step: accepts the control stream and
+/// runs [`host_authenticate`]. Throttling is keyed by the peer's IP
+/// (canonical form).
+pub async fn host_login(
     conn: &quinn::Connection,
     auth: &HostAuth<'_>,
     ours: &Hello,
-) -> Result<HostSession<quinn::RecvStream, quinn::SendStream>, SessionError> {
+    require_password: bool,
+) -> Result<PendingLogin<quinn::RecvStream, quinn::SendStream>, SessionError> {
     let binding = crate::endpoint::channel_binding(conn)
         .map_err(|e| SessionError::Protocol(e.to_string()))?;
     let (writer, reader) = crate::streams::accept_control(conn)
         .await
         .map_err(|e| SessionError::Protocol(e.to_string()))?;
     let peer = crate::peer::canonical(conn.remote_address()).ip();
-    host_session(reader, writer, auth, &binding, ours, peer).await
+    host_authenticate(reader, writer, auth, &binding, ours, peer, require_password).await
+}
+
+/// Host side on a QUIC connection, password only: [`host_login`] with a
+/// required password, then accept.
+pub async fn host_handshake(
+    conn: &quinn::Connection,
+    auth: &HostAuth<'_>,
+    ours: &Hello,
+) -> Result<HostSession<quinn::RecvStream, quinn::SendStream>, SessionError> {
+    host_login(conn, auth, ours, true)
+        .await?
+        .accept(auth.peer_info.clone())
+        .await
 }
 
 #[cfg(test)]
@@ -553,7 +728,7 @@ mod tests {
             (
                 SecureControl<DuplexStream, DuplexStream>,
                 Negotiated,
-                PasswordKind,
+                Option<PasswordKind>,
             ),
             SessionError,
         >,
@@ -568,6 +743,7 @@ mod tests {
             throttle: &host.throttle,
             peer_info: local_peer_info("test", &[Codec::Vp9]),
         };
+        let mut nothing = || {};
         tokio::join!(
             client_session(
                 cr,
@@ -576,10 +752,159 @@ mod tests {
                 &host_key,
                 client_binding,
                 &hello,
-                password
+                Credentials::Password(password),
+                &mut nothing,
             ),
             host_session(hr, hw, &auth, b"binding", &hello, PEER),
         )
+    }
+
+    type ClientResult = Result<
+        (
+            SecureControl<DuplexStream, DuplexStream>,
+            Negotiated,
+            Option<PasswordKind>,
+        ),
+        SessionError,
+    >;
+
+    /// Runs a login that the host's "user" decides with `decide` after
+    /// `host_authenticate`. Returns the client's result, how often it was
+    /// told to wait, and the client info the host saw.
+    async fn run_approval(
+        host: &Host,
+        credentials: Credentials<'_>,
+        require_password: bool,
+        accept: bool,
+    ) -> (ClientResult, u32, Option<v1::PeerInfo>) {
+        let ((cr, cw), (hr, hw)) = pipes();
+        let client_id = DeviceIdentity::generate().unwrap();
+        let hello = make_hello(&[v1::Capability::VideoVp9], "approval-test");
+        let auth = HostAuth {
+            identity: &host.identity,
+            passwords: &host.passwords,
+            throttle: &host.throttle,
+            peer_info: local_peer_info("test", &[Codec::Vp9]),
+        };
+        let waits = std::sync::atomic::AtomicU32::new(0);
+        let mut count_wait = || {
+            waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let key = host.identity.public_key();
+        let (client, seen) = tokio::join!(
+            client_session(
+                cr,
+                cw,
+                &client_id,
+                &key,
+                b"binding",
+                &hello,
+                credentials,
+                &mut count_wait,
+            ),
+            async {
+                let Ok(mut pending) =
+                    host_authenticate(hr, hw, &auth, b"binding", &hello, PEER, require_password)
+                        .await
+                else {
+                    return None;
+                };
+                let info = pending.client().clone();
+                pending.notify_pending().await.unwrap();
+                if accept {
+                    let _keep = pending.accept(auth.peer_info.clone()).await.unwrap();
+                    // Keep the host side open until the client has read the result.
+                    tokio::task::yield_now().await;
+                    Some(info)
+                } else {
+                    pending.reject(LoginError::Denied).await.unwrap();
+                    Some(info)
+                }
+            }
+        );
+        (
+            client,
+            waits.load(std::sync::atomic::Ordering::Relaxed),
+            seen,
+        )
+    }
+
+    #[tokio::test]
+    async fn click_approval_lets_a_viewer_in_without_a_password() {
+        let host = Host::new(ThrottleConfig::default());
+        let (client, waits, seen) = run_approval(&host, Credentials::AskHost, false, true).await;
+        let (_, _, kind) = client.unwrap();
+        assert_eq!(kind, None, "no password used");
+        assert_eq!(waits, 1, "told to wait once");
+        let seen = seen.unwrap();
+        assert_eq!(
+            seen.agent, "approval-test",
+            "the host saw who is connecting"
+        );
+        assert!(!seen.platform.is_empty());
+        // A password offered to a click-only host is simply not used.
+        let temporary = host.temporary();
+        let (client, _, _) =
+            run_approval(&host, Credentials::Password(&temporary), false, true).await;
+        assert_eq!(client.unwrap().2, None);
+        assert_eq!(host.temporary(), temporary, "temporary password untouched");
+    }
+
+    #[tokio::test]
+    async fn click_denial_is_reported_to_the_viewer() {
+        let host = Host::new(ThrottleConfig::default());
+        let (client, waits, _) = run_approval(&host, Credentials::AskHost, false, false).await;
+        assert!(matches!(
+            client,
+            Err(SessionError::Rejected {
+                error: LoginError::Denied,
+                ..
+            })
+        ));
+        assert_eq!(waits, 1);
+    }
+
+    #[tokio::test]
+    async fn password_and_click_needs_both() {
+        let host = Host::new(ThrottleConfig::default());
+        // Right password, then accepted.
+        let temporary = host.temporary();
+        let (client, waits, _) =
+            run_approval(&host, Credentials::Password(&temporary), true, true).await;
+        assert_eq!(client.unwrap().2, Some(PasswordKind::Temporary));
+        assert_eq!(waits, 1);
+        // Right password, then denied.
+        let temporary = host.temporary();
+        let (client, _, _) =
+            run_approval(&host, Credentials::Password(&temporary), true, false).await;
+        assert!(matches!(
+            client,
+            Err(SessionError::Rejected {
+                error: LoginError::Denied,
+                ..
+            })
+        ));
+        // Wrong password: refused before anyone is asked.
+        let (client, waits, seen) =
+            run_approval(&host, Credentials::Password("nope-nope"), true, true).await;
+        assert!(matches!(
+            client,
+            Err(SessionError::Rejected {
+                error: LoginError::WrongPassword,
+                ..
+            })
+        ));
+        assert_eq!((waits, seen), (0, None));
+        // No password at all: refused, the host requires one.
+        let (client, _, seen) = run_approval(&host, Credentials::AskHost, true, true).await;
+        assert!(matches!(
+            client,
+            Err(SessionError::Rejected {
+                error: LoginError::PasswordRequired,
+                ..
+            })
+        ));
+        assert!(seen.is_none());
     }
 
     #[tokio::test]
@@ -589,8 +914,8 @@ mod tests {
         let (client, server) = run(&host, key, &host.temporary(), b"binding").await;
         let (mut client, negotiated, kind) = client.unwrap();
         let mut server = server.unwrap();
-        assert_eq!(kind, PasswordKind::Temporary);
-        assert_eq!(server.password, PasswordKind::Temporary);
+        assert_eq!(kind, Some(PasswordKind::Temporary));
+        assert_eq!(server.password, Some(PasswordKind::Temporary));
         assert!(negotiated.has(v1::Capability::VideoVp9));
         assert_eq!(client.remote(), &key);
 
@@ -663,7 +988,7 @@ mod tests {
         let temporary = host.temporary();
         for _ in 0..2 {
             let (client, _) = run(&host, key, "correct horse", b"binding").await;
-            assert_eq!(client.unwrap().2, PasswordKind::Permanent);
+            assert_eq!(client.unwrap().2, Some(PasswordKind::Permanent));
         }
         assert_eq!(host.temporary(), temporary, "temporary password untouched");
     }

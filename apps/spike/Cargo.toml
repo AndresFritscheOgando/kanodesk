@@ -19,6 +19,7 @@ path = "src/bin/spike-viewer.rs"
 kanodesk-capture.workspace = true
 kanodesk-client.workspace = true
 kanodesk-codec.workspace = true
+kanodesk-config.workspace = true
 kanodesk-crypto.workspace = true
 kanodesk-host.workspace = true
 kanodesk-input.workspace = true

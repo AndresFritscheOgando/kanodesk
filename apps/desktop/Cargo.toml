@@ -1,6 +1,6 @@
 [package]
 name = "kanodesk-desktop"
-description = "KanoDesk desktop app (main window and remote viewer)"
+description = "KanoDesk desktop app (host process, connection manager; main window and viewer later)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,19 @@ publish.workspace = true
 [[bin]]
 name = "kanodesk"
 path = "src/main.rs"
+test = false
 
 [dependencies]
+eframe.workspace = true
+kanodesk-config.workspace = true
+kanodesk-crypto.workspace = true
+kanodesk-host.workspace = true
+kanodesk-input.workspace = true
+kanodesk-ipc.workspace = true
+kanodesk-transport.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

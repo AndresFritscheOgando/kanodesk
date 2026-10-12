@@ -71,6 +71,7 @@ envelope_from!(ControlMessage, control_message,
     NoiseHandshake => NoiseHandshake,
     Sealed => Sealed,
     AuthConfirm => AuthConfirm,
+    LoginPending => LoginPending,
 );
 
 envelope_from!(VideoMessage, video_message,

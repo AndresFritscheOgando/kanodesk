@@ -114,6 +114,17 @@ pub fn closed_by_peer(conn: &Connection) -> bool {
     )
 }
 
+/// The reason the peer gave when it closed `conn`, if it closed it
+/// deliberately.
+pub fn peer_close_message(conn: &Connection) -> Option<String> {
+    match conn.close_reason() {
+        Some(quinn::ConnectionError::ApplicationClosed(c)) => {
+            Some(String::from_utf8_lossy(&c.reason).into_owned())
+        }
+        _ => None,
+    }
+}
+
 /// Closes every connection on `endpoint` and waits (up to 500 ms) for the
 /// close frames to go out, so peers notice at once instead of at the idle timeout.
 pub async fn shutdown(endpoint: &Endpoint, reason: &[u8]) {
@@ -267,6 +278,8 @@ mod tests {
             quinn::ConnectionError::ApplicationClosed(_)
         ));
         assert!(closed_by_peer(&host_conn));
+        assert_eq!(peer_close_message(&host_conn).as_deref(), Some("bye"));
+        assert_eq!(peer_close_message(&conn), None, "closed here");
         assert!(!closed_by_peer(&conn), "closed locally, not by the peer");
     }
 

@@ -24,7 +24,9 @@ use kanodesk_rendezvous::{
     DEFAULT_PORT, DeviceId, NetworkInfo, RendezvousClient, RendezvousConfig,
 };
 use kanodesk_transport::peer::{PeerSocket, canonical};
-use kanodesk_transport::session::{HostAuth, client_handshake, host_handshake, local_peer_info};
+use kanodesk_transport::session::{
+    Credentials, HostAuth, client_handshake, host_handshake, local_peer_info,
+};
 use kanodesk_transport::tls::{Identity, ServerTrust};
 use kanodesk_transport::{nat, upnp};
 
@@ -342,7 +344,7 @@ async fn serve(state: Arc<HostState>, conn: kanodesk_transport::Connection) {
         session.control.remote(),
         session.password
     );
-    if session.password == PasswordKind::Temporary {
+    if session.password == Some(PasswordKind::Temporary) {
         // Each temporary password admits one login.
         println!(
             "new temporary password {}",
@@ -529,11 +531,12 @@ pub async fn run_connect(args: Args) -> Result<(), BoxError> {
         &device.identity,
         &info.host.key,
         &ours,
-        &password,
+        Credentials::Password(&password),
+        &mut || println!("waiting for the host's user to accept"),
     )
     .await?;
     println!(
-        "LOGGED IN in {} ms: host device verified, {:?} password, protocol v{}",
+        "LOGGED IN in {} ms: host device verified, password {:?}, protocol v{}",
         t.elapsed().as_millis(),
         kind,
         negotiated.version

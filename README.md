@@ -25,6 +25,7 @@ Status: early scaffold. See [PROGRESS.md](PROGRESS.md) for what works and what's
 | `crates/platform` | OS integration (service, sessions, autostart) |
 | `apps/desktop` | Desktop UI (`kanodesk`) |
 | `apps/service` | Windows service wrapper (`kanodesk-service`) |
+| `crates/ipc` | Local IPC (named pipes, postcard) between the host process and the UI |
 | `apps/cli` | Provisioning CLI (`kanodesk-cli`); for now the `p2p-host` / `p2p-connect` network diagnostics |
 | `apps/spike` | Phase 0 spike: `spike-host` and `spike-viewer` |
 | `server/idserver` | ID/rendezvous server (`kanodesk-idserver`): registration, lookups, online status, connect broker |
@@ -164,6 +165,28 @@ On Windows, AddressSanitizer needs the MSVC runtime DLL on `PATH`: add `VC\Tools
 ```bash
 cargo +nightly fuzz run decode_frames -- -max_total_time=60
 ```
+
+### Host and connection manager
+
+`kanodesk --server` is the host process: it reads the config, keeps its device key in the key store, and accepts direct connections (UDP 21118 by default). When someone connects, it opens the connection-manager window (`kanodesk --cm`): who is connecting, **Accept**/**Deny**, keyboard and mouse toggles that apply at once, and **Disconnect**. Approval modes (`approve-mode`): `password` (the viewer needs the password; the window just shows the session), `click` (no password; you accept), `both`.
+
+```bash
+cargo run --release -p kanodesk-desktop -- --server --approve-mode click --listen 127.0.0.1:9200
+```
+
+It prints its device key (and the temporary password in `password`/`both` mode). Connect with the spike viewer; `--ask-host` asks for a click instead of sending a password:
+
+```bash
+cargo run --release -p kanodesk-spike --bin spike-viewer -- --connect 127.0.0.1:9200 --host-key <device key> --ask-host
+```
+
+The window comes to the front; Accept is disabled for the first second (so a remote viewer cannot click it). Denying turns the viewer away before any video; Disconnect ends the session and its video at once. The window closes itself a few seconds after the last session ends. The same actions from a terminal:
+
+```bash
+cargo run --release -p kanodesk-desktop -- --cm-cmd list
+```
+
+(`accept ID`, `deny ID`, `disconnect ID`, `perms ID keyboard=off mouse=on`). Settings live in `%APPDATA%\KanoDesk\config\kanodesk.toml` (option table in `crates/config/src/options.rs`: `approve-mode`, `enable-keyboard`, `enable-mouse`, `direct-access-listen`, `custom-fps`, `video-bitrate-kbps`, `hide_cm`, …); command-line values override it for one run. Secrets stay in the key store under `%LOCALAPPDATA%\KanoDesk\data\host`.
 
 ### Phase 0 spike: stream your screen
 
