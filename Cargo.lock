@@ -1642,6 +1642,7 @@ dependencies = [
  "kanodesk-crypto",
  "kanodesk-host",
  "kanodesk-idserver",
+ "kanodesk-input",
  "kanodesk-proto",
  "kanodesk-relay",
  "kanodesk-rendezvous",
@@ -1649,6 +1650,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "winit",
 ]
 
 [[package]]
@@ -1690,6 +1692,7 @@ name = "kanodesk-host"
 version = "0.1.0"
 dependencies = [
  "kanodesk-crypto",
+ "kanodesk-input",
  "kanodesk-proto",
  "kanodesk-rendezvous",
  "kanodesk-transport",
@@ -1714,6 +1717,11 @@ dependencies = [
 [[package]]
 name = "kanodesk-input"
 version = "0.1.0"
+dependencies = [
+ "kanodesk-proto",
+ "thiserror 2.0.21",
+ "windows",
+]
 
 [[package]]
 name = "kanodesk-platform"
@@ -1767,8 +1775,11 @@ name = "kanodesk-spike"
 version = "0.1.0"
 dependencies = [
  "kanodesk-capture",
+ "kanodesk-client",
  "kanodesk-codec",
  "kanodesk-crypto",
+ "kanodesk-host",
+ "kanodesk-input",
  "kanodesk-proto",
  "kanodesk-transport",
  "naga",

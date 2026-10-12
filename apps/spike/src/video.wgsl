@@ -1,4 +1,5 @@
-// Draws one I420 frame letterboxed into the target, plus a text overlay.
+// Draws one I420 frame letterboxed into the target, the host's cursor on
+// top of the video when asked, and a text overlay.
 // Colour: BT.601 limited range, matching kanodesk_codec::convert.
 
 struct Params {
@@ -12,6 +13,10 @@ struct Params {
     text: array<vec4<u32>, 16>,
     // 3x5 glyph bitmaps (bit row*3+col), four per vec4.
     font: array<vec4<u32>, 16>,
+    // Cursor image rectangle in video UV: left, top, width, height.
+    cursor_rect: vec4<f32>,
+    // Used part of the cursor texture (u, v), and 1 when the cursor is shown.
+    cursor_uv: vec4<f32>,
 };
 
 @group(0) @binding(0) var y_tex: texture_2d<f32>;
@@ -19,6 +24,7 @@ struct Params {
 @group(0) @binding(2) var v_tex: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
 @group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(5) var cursor_tex: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -90,6 +96,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let u = textureSampleLevel(u_tex, samp, video_uv, 0.0).r;
         let v = textureSampleLevel(v_tex, samp, video_uv, 0.0).r;
         color = yuv_to_rgb(y, u, v);
+        if (params.cursor_uv.z > 0.5) {
+            let local = (video_uv - params.cursor_rect.xy) / params.cursor_rect.zw;
+            if (all(local >= vec2<f32>(0.0)) && all(local < vec2<f32>(1.0))) {
+                let c = textureSampleLevel(cursor_tex, samp, local * params.cursor_uv.xy, 0.0);
+                color = mix(color, c.rgb, c.a);
+            }
+        }
     }
     let o = overlay(in.pos.xy);
     return vec4<f32>(mix(color, o.rgb, o.a), 1.0);

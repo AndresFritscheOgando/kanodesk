@@ -1,5 +1,6 @@
 //! wgpu rendering of I420 frames: three `R8Unorm` plane textures, converted
-//! to RGB in `video.wgsl`, letterboxed, with the stats overlay on top.
+//! to RGB in `video.wgsl`, letterboxed, with the host's cursor (an RGBA
+//! texture, when the viewer asks for it) and the stats overlay on top.
 //!
 //! [`VideoPipeline`] draws into any texture view (tested offscreen);
 //! [`SurfaceRenderer`] wraps it with a window surface.
@@ -14,8 +15,71 @@ use crate::overlay::{FONT_SLOTS, MAX_CHARS, encode_text, font_table};
 /// The WGSL shader.
 pub const SHADER: &str = include_str!("video.wgsl");
 
-/// Size of the shader's `Params` uniform: header (16) + text (256) + font (256).
-pub const UNIFORM_SIZE: usize = 16 + MAX_CHARS * 4 + FONT_SLOTS * 4;
+/// Size of the shader's `Params` uniform: header (16) + text (256) + font
+/// (256) + cursor (32).
+pub const UNIFORM_SIZE: usize = 16 + MAX_CHARS * 4 + FONT_SLOTS * 4 + 32;
+
+/// Side of the cursor texture; larger cursors are scaled down to fit.
+pub const CURSOR_TEXTURE: u32 = 256;
+
+/// Where to draw the cursor image, for the shader: its rectangle in video
+/// UV (left, top, width, height) and the used part of the texture (u, v).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CursorUniform {
+    /// Left, top, width, height in video UV.
+    pub rect: [f32; 4],
+    /// Used fraction of the cursor texture.
+    pub uv: [f32; 2],
+}
+
+/// The cursor's place for a video of `video` pixels: image `size` with hot
+/// spot `hot`, hot spot at `pos` (video pixels).
+pub fn cursor_uniform(
+    video: (u32, u32),
+    size: (u32, u32),
+    hot: (u32, u32),
+    pos: (f32, f32),
+) -> Option<CursorUniform> {
+    if video.0 == 0 || video.1 == 0 || size.0 == 0 || size.1 == 0 {
+        return None;
+    }
+    let (vw, vh) = (video.0 as f32, video.1 as f32);
+    Some(CursorUniform {
+        rect: [
+            (pos.0 - hot.0 as f32) / vw,
+            (pos.1 - hot.1 as f32) / vh,
+            size.0 as f32 / vw,
+            size.1 as f32 / vh,
+        ],
+        uv: [
+            size.0.min(CURSOR_TEXTURE) as f32 / CURSOR_TEXTURE as f32,
+            size.1.min(CURSOR_TEXTURE) as f32 / CURSOR_TEXTURE as f32,
+        ],
+    })
+}
+
+/// Shrinks an RGBA image to fit `max` × `max` (nearest neighbour), keeping
+/// its aspect ratio. Returns the image, its size and the scale applied.
+pub fn fit_rgba(rgba: &[u8], width: u32, height: u32, max: u32) -> (Vec<u8>, u32, u32, f32) {
+    if width <= max && height <= max {
+        return (rgba.to_vec(), width, height, 1.0);
+    }
+    let scale = max as f32 / width.max(height) as f32;
+    let (w, h) = (
+        ((width as f32 * scale) as u32).max(1),
+        ((height as f32 * scale) as u32).max(1),
+    );
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        let sy = ((y as f32 / scale) as u32).min(height - 1);
+        for x in 0..w {
+            let sx = ((x as f32 / scale) as u32).min(width - 1);
+            let i = ((sy * width + sx) * 4) as usize;
+            out.extend_from_slice(&rgba[i..i + 4]);
+        }
+    }
+    (out, w, h, scale)
+}
 
 /// Renderer setup errors.
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +119,7 @@ pub fn uniform_bytes(
     glyph_px: f32,
     text: &[u32],
     font: &[u32; FONT_SLOTS],
+    cursor: Option<CursorUniform>,
 ) -> Vec<u8> {
     let text = &text[..text.len().min(MAX_CHARS)];
     let mut out = Vec::with_capacity(UNIFORM_SIZE);
@@ -67,6 +132,13 @@ pub fn uniform_bytes(
     }
     for bits in font {
         out.extend_from_slice(&bits.to_le_bytes());
+    }
+    let (rect, uv, on) = match cursor {
+        Some(c) => (c.rect, c.uv, 1.0f32),
+        None => ([0.0, 0.0, 1.0, 1.0], [0.0, 0.0], 0.0),
+    };
+    for v in rect.into_iter().chain(uv).chain([on, 0.0]) {
+        out.extend_from_slice(&v.to_le_bytes());
     }
     debug_assert_eq!(out.len(), UNIFORM_SIZE);
     out
@@ -86,6 +158,21 @@ struct Planes {
     bind_group: wgpu::BindGroup,
 }
 
+/// The cursor image and where it goes.
+struct Cursor {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// Image size as uploaded (after fitting) and its hot spot.
+    size: (u32, u32),
+    hot: (u32, u32),
+    /// Factor applied when fitting (image pixels per original pixel).
+    fit: f32,
+    /// Original size, in video pixels.
+    shown_size: (f32, f32),
+    /// Hot-spot position in video pixels, when shown.
+    pos: Option<(f32, f32)>,
+}
+
 /// Pipeline, plane textures and uniforms for drawing I420 frames.
 pub struct VideoPipeline {
     pipeline: wgpu::RenderPipeline,
@@ -93,6 +180,7 @@ pub struct VideoPipeline {
     sampler: wgpu::Sampler,
     uniforms: wgpu::Buffer,
     planes: Planes,
+    cursor: Cursor,
     font: [u32; FONT_SLOTS],
 }
 
@@ -135,6 +223,7 @@ impl VideoPipeline {
                     },
                     count: None,
                 },
+                texture_entry(5),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -179,13 +268,37 @@ impl VideoPipeline {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let planes = Self::create_planes(device, &layout, &sampler, &uniforms, 2, 2);
+        let cursor_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cursor"),
+            size: wgpu::Extent3d {
+                width: CURSOR_TEXTURE,
+                height: CURSOR_TEXTURE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let cursor = Cursor {
+            view: cursor_texture.create_view(&Default::default()),
+            texture: cursor_texture,
+            size: (0, 0),
+            hot: (0, 0),
+            fit: 1.0,
+            shown_size: (0.0, 0.0),
+            pos: None,
+        };
+        let planes = Self::create_planes(device, &layout, &sampler, &uniforms, &cursor.view, 2, 2);
         let mut video = VideoPipeline {
             pipeline,
             layout,
             sampler,
             uniforms,
             planes,
+            cursor,
             font: font_table(),
         };
         video.upload(device, queue, &I420Frame::new(2, 2));
@@ -198,6 +311,7 @@ impl VideoPipeline {
         layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
         uniforms: &wgpu::Buffer,
+        cursor: &wgpu::TextureView,
         width: u32,
         height: u32,
     ) -> Planes {
@@ -246,6 +360,10 @@ impl VideoPipeline {
                     binding: 4,
                     resource: uniforms.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(cursor),
+                },
             ],
         });
         Planes {
@@ -267,8 +385,15 @@ impl VideoPipeline {
     pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &I420Frame) {
         let (w, h) = (frame.width(), frame.height());
         if (w, h) != (self.planes.width, self.planes.height) {
-            self.planes =
-                Self::create_planes(device, &self.layout, &self.sampler, &self.uniforms, w, h);
+            self.planes = Self::create_planes(
+                device,
+                &self.layout,
+                &self.sampler,
+                &self.uniforms,
+                &self.cursor.view,
+                w,
+                h,
+            );
         }
         let write = |texture: &wgpu::Texture, data: &[u8], pw: u32, ph: u32| {
             queue.write_texture(
@@ -306,13 +431,85 @@ impl VideoPipeline {
         );
     }
 
-    /// Updates letterboxing for a `target` size and the overlay text.
+    /// Sets the cursor image (RGBA, straight alpha) and its hot spot.
+    /// `video_per_pixel` is how many video pixels one image pixel covers (the
+    /// stream's scale relative to the host display).
+    pub fn set_cursor_image(
+        &mut self,
+        queue: &wgpu::Queue,
+        rgba: &[u8],
+        size: (u32, u32),
+        hot: (u32, u32),
+        video_per_pixel: f32,
+    ) {
+        if size.0 == 0 || size.1 == 0 || rgba.len() < (size.0 * size.1 * 4) as usize {
+            self.cursor.size = (0, 0);
+            return;
+        }
+        let (image, w, h, fit) = fit_rgba(rgba, size.0, size.1, CURSOR_TEXTURE);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.cursor.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &image,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.cursor.size = (w, h);
+        self.cursor.fit = fit;
+        self.cursor.hot = hot;
+        self.cursor.shown_size = (
+            size.0 as f32 * video_per_pixel,
+            size.1 as f32 * video_per_pixel,
+        );
+    }
+
+    /// Shows the cursor with its hot spot at `pos` (video pixels), or hides it.
+    pub fn set_cursor_position(&mut self, pos: Option<(f32, f32)>) {
+        self.cursor.pos = pos;
+    }
+
+    fn cursor_uniform(&self) -> Option<CursorUniform> {
+        let pos = self.cursor.pos?;
+        let c = &self.cursor;
+        if c.size == (0, 0) {
+            return None;
+        }
+        // Rectangle of the original (unfitted) image in video pixels; the
+        // texture holds the fitted copy, which covers the same area.
+        let scale = c.shown_size.0 / (c.size.0 as f32 / c.fit);
+        let hot = (c.hot.0 as f32 * scale, c.hot.1 as f32 * scale);
+        let video = self.video_size();
+        let (vw, vh) = (video.0 as f32, video.1 as f32);
+        let mut u = cursor_uniform(video, c.size, (0, 0), (0.0, 0.0))?;
+        u.rect = [
+            (pos.0 - hot.0) / vw,
+            (pos.1 - hot.1) / vh,
+            c.shown_size.0 / vw,
+            c.shown_size.1 / vh,
+        ];
+        Some(u)
+    }
+
+    /// Updates letterboxing for a `target` size, the overlay text and the cursor.
     pub fn set_overlay(&self, queue: &wgpu::Queue, target: (u32, u32), text: &str) {
         let bytes = uniform_bytes(
             letterbox_scale(self.video_size(), target),
             glyph_px_for(target.0),
             &encode_text(text),
             &self.font,
+            self.cursor_uniform(),
         );
         queue.write_buffer(&self.uniforms, 0, &bytes);
     }
@@ -423,6 +620,23 @@ impl SurfaceRenderer {
         self.video.upload(&self.device, &self.queue, frame);
     }
 
+    /// Sets the drawn cursor's image; see [`VideoPipeline::set_cursor_image`].
+    pub fn set_cursor_image(
+        &mut self,
+        rgba: &[u8],
+        size: (u32, u32),
+        hot: (u32, u32),
+        video_per_pixel: f32,
+    ) {
+        self.video
+            .set_cursor_image(&self.queue, rgba, size, hot, video_per_pixel);
+    }
+
+    /// Shows the drawn cursor at `pos` (video pixels), or hides it.
+    pub fn set_cursor_position(&mut self, pos: Option<(f32, f32)>) {
+        self.video.set_cursor_position(pos);
+    }
+
     /// Draws the current frame and overlay and presents. Returns `false` if
     /// nothing was presented (window minimised, surface being rebuilt).
     pub fn render(&mut self, overlay_text: &str) -> bool {
@@ -472,8 +686,20 @@ mod tests {
     #[test]
     fn uniform_layout_matches_size_and_positions() {
         let font = font_table();
-        let bytes = uniform_bytes([0.5, 1.0], 3.0, &[7, 8], &font);
+        let bytes = uniform_bytes([0.5, 1.0], 3.0, &[7, 8], &font, None);
         assert_eq!(bytes.len(), UNIFORM_SIZE);
+        let cursor_start = 16 + MAX_CHARS * 4 + FONT_SLOTS * 4;
+        let f = |b: &[u8], i: usize| f32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        assert_eq!(f(&bytes, cursor_start + 24), 0.0, "cursor off");
+        let c = CursorUniform {
+            rect: [0.25, 0.5, 0.1, 0.2],
+            uv: [0.125, 0.25],
+        };
+        let with_cursor = uniform_bytes([1.0, 1.0], 2.0, &[], &font, Some(c));
+        assert_eq!(f(&with_cursor, cursor_start), 0.25);
+        assert_eq!(f(&with_cursor, cursor_start + 12), 0.2);
+        assert_eq!(f(&with_cursor, cursor_start + 16), 0.125);
+        assert_eq!(f(&with_cursor, cursor_start + 24), 1.0, "cursor on");
         assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0.5);
         assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
         assert_eq!(f32::from_le_bytes(bytes[12..16].try_into().unwrap()), 3.0);
@@ -484,6 +710,27 @@ mod tests {
             u32::from_le_bytes(bytes[font_start + 4..font_start + 8].try_into().unwrap()),
             font[1]
         );
+    }
+
+    #[test]
+    fn cursor_rectangles_and_fitting() {
+        // 32x32 cursor, hot spot (4, 2), at (100, 50) on a 1000x500 video.
+        let u = cursor_uniform((1000, 500), (32, 32), (4, 2), (100.0, 50.0)).unwrap();
+        assert_eq!(u.rect, [0.096, 0.096, 0.032, 0.064]);
+        assert_eq!(u.uv, [0.125, 0.125]);
+        assert!(cursor_uniform((0, 0), (32, 32), (0, 0), (0.0, 0.0)).is_none());
+        // Small images are kept; a 512x256 one is halved to fit 256.
+        let small = vec![9u8; 4 * 4 * 4];
+        assert_eq!(fit_rgba(&small, 4, 4, 256), (small.clone(), 4, 4, 1.0));
+        let mut big = vec![0u8; 512 * 256 * 4];
+        // Nearest neighbour at half size samples even source pixels: the
+        // output's last pixel comes from (510, 254).
+        let i = (254 * 512 + 510) * 4;
+        big[i..i + 4].copy_from_slice(&[1, 2, 3, 4]);
+        let (img, w, h, scale) = fit_rgba(&big, 512, 256, 256);
+        assert_eq!((w, h, scale), (256, 128, 0.5));
+        assert_eq!(img.len(), 256 * 128 * 4);
+        assert_eq!(&img[img.len() - 4..], &[1, 2, 3, 4]);
     }
 
     #[test]
@@ -527,6 +774,9 @@ mod tests {
         u.fill(90);
         v.fill(240);
         video.upload(&device, &queue, &frame);
+        // A 4x4 opaque green cursor, hot spot (1, 1), at video pixel (48, 9).
+        video.set_cursor_image(&queue, &[0, 255, 0, 255].repeat(16), (4, 4), (1, 1), 1.0);
+        video.set_cursor_position(Some((48.0, 9.0)));
         video.set_overlay(&queue, (64, 64), "8");
 
         let (tw, th) = (64u32, 64u32);
@@ -597,6 +847,13 @@ mod tests {
         );
         // (9,9) is box padding: 75 % black over the letterbox bar.
         assert!(near(px(9, 9), [0, 0, 0]), "box padding: {:?}", px(9, 9));
+        // The cursor: video (47..51, 8..12) → target (47..51, 24..28) (bars of 16 px).
+        assert!(near(px(48, 25), [0, 255, 0]), "cursor: {:?}", px(48, 25));
+        assert!(
+            near(px(52, 25), [255, 0, 0]),
+            "beside the cursor: {:?}",
+            px(52, 25)
+        );
         // Inside the 8's hollow (middle column, second row) over red: dimmed red.
         assert!(
             near(px(13, 13), [64, 0, 0]) || near(px(13, 13), [0, 0, 0]),

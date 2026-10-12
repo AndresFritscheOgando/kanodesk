@@ -29,7 +29,16 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::{HRESULT, Interface};
 
+use crate::cursor::{
+    CursorShape, CursorState, color_to_rgba, masked_color_to_rgba, monochrome_to_rgba,
+};
 use crate::{BYTES_PER_PIXEL, CaptureError, Capturer, DisplayInfo, Frame, clock, copy_rows};
+use std::sync::Arc;
+use windows::Win32::Graphics::Dxgi::{
+    DXGI_OUTDUPL_POINTER_POSITION, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
+};
 
 /// What to do after a DXGI call fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +222,47 @@ enum Acquired {
     PointerOnly,
 }
 
+/// Reads the new pointer shape of the current frame (before it is released).
+fn read_pointer_shape(
+    duplication: &IDXGIOutputDuplication,
+    size: u32,
+    buffer: &mut Vec<u8>,
+) -> windows::core::Result<Option<CursorShape>> {
+    buffer.resize(size as usize, 0);
+    let mut required = 0u32;
+    let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+    // SAFETY: the buffer has `size` writable bytes; out pointers are valid locals.
+    unsafe {
+        duplication.GetFramePointerShape(size, buffer.as_mut_ptr().cast(), &mut required, &mut info)
+    }?;
+    let data = &buffer[..required.min(size) as usize];
+    let (width, pitch) = (info.Width, info.Pitch);
+    let (height, rgba) = match info.Type as i32 {
+        t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 => {
+            // The height covers both masks.
+            let h = info.Height / 2;
+            (h, monochrome_to_rgba(width, h, pitch, data))
+        }
+        t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 => {
+            (info.Height, color_to_rgba(width, info.Height, pitch, data))
+        }
+        t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 => (
+            info.Height,
+            masked_color_to_rgba(width, info.Height, pitch, data),
+        ),
+        _ => (0, None),
+    };
+    Ok(rgba.map(|rgba| {
+        CursorShape::new(
+            width,
+            height,
+            info.HotSpot.x.max(0) as u32,
+            info.HotSpot.y.max(0) as u32,
+            rgba,
+        )
+    }))
+}
+
 /// DXGI Desktop Duplication capturer for one output.
 pub struct DxgiCapturer {
     display: DisplayInfo,
@@ -222,6 +272,10 @@ pub struct DxgiCapturer {
     height: u32,
     timestamp_us: u64,
     has_image: bool,
+    cursor: CursorState,
+    /// Top-left of the pointer image, as DXGI reports it.
+    pointer_origin: (i32, i32),
+    shape_buffer: Vec<u8>,
 }
 
 impl DxgiCapturer {
@@ -267,6 +321,21 @@ impl DxgiCapturer {
                 .AcquireNextFrame(timeout_ms, &mut info, &mut resource)
         }?;
 
+        // Pointer updates ride along with frames; the shape must be read
+        // before the frame is released. A failed shape read only loses the shape.
+        let pointer = (info.LastMouseUpdateTime != 0).then_some(info.PointerPosition);
+        let shape = if info.PointerShapeBufferSize > 0 {
+            read_pointer_shape(
+                &session.duplication,
+                info.PointerShapeBufferSize,
+                &mut self.shape_buffer,
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+
         // From here on the frame must be released, whatever happens.
         let result = (|| {
             if info.LastPresentTime == 0 {
@@ -295,6 +364,7 @@ impl DxgiCapturer {
         drop(resource);
         // SAFETY: a frame was acquired above.
         let released = unsafe { session.duplication.ReleaseFrame() };
+        self.update_cursor(pointer, shape);
         let acquired = result?;
         released?;
 
@@ -302,6 +372,45 @@ impl DxgiCapturer {
             self.read_staging()?;
         }
         Ok(acquired)
+    }
+
+    /// Applies a pointer update; bumps the serial if anything changed.
+    fn update_cursor(
+        &mut self,
+        pointer: Option<DXGI_OUTDUPL_POINTER_POSITION>,
+        shape: Option<CursorShape>,
+    ) {
+        let before = (
+            self.cursor.visible,
+            self.cursor.x,
+            self.cursor.y,
+            self.cursor.shape.as_ref().map(|s| s.id),
+        );
+        if let Some(shape) = shape
+            && self.cursor.shape.as_ref().map(|s| s.id) != Some(shape.id)
+        {
+            self.cursor.shape = Some(Arc::new(shape));
+        }
+        if let Some(p) = pointer {
+            self.pointer_origin = (p.Position.x, p.Position.y);
+            self.cursor.visible = p.Visible.as_bool();
+        }
+        let hot = self
+            .cursor
+            .shape
+            .as_ref()
+            .map_or((0, 0), |s| (s.hot_x as i32, s.hot_y as i32));
+        self.cursor.x = self.pointer_origin.0 + hot.0;
+        self.cursor.y = self.pointer_origin.1 + hot.1;
+        let after = (
+            self.cursor.visible,
+            self.cursor.x,
+            self.cursor.y,
+            self.cursor.shape.as_ref().map(|s| s.id),
+        );
+        if after != before {
+            self.cursor.serial += 1;
+        }
     }
 
     /// Maps the staging texture and copies it into the tightly packed buffer.
@@ -369,6 +478,9 @@ impl Capturer for DxgiCapturer {
             height: 0,
             timestamp_us: 0,
             has_image: false,
+            cursor: CursorState::default(),
+            pointer_origin: (0, 0),
+            shape_buffer: Vec::new(),
         })
     }
 
@@ -399,6 +511,10 @@ impl Capturer for DxgiCapturer {
                 Recovery::Fatal => Err(os_error("AcquireNextFrame", e)),
             },
         }
+    }
+
+    fn cursor(&self) -> Option<&CursorState> {
+        Some(&self.cursor)
     }
 }
 
@@ -439,6 +555,50 @@ mod tests {
         let displays = DxgiCapturer::displays().unwrap();
         assert!(!displays.is_empty());
         assert!(displays.iter().any(|d| d.primary));
+    }
+
+    fn nudge_pointer() {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+        let mut p = POINT::default();
+        // SAFETY: valid out pointer; same DPI context for both calls.
+        unsafe {
+            GetCursorPos(&mut p).unwrap();
+            SetCursorPos(p.x + 1, p.y).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            SetCursorPos(p.x, p.y).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "needs an interactive desktop; nudges the pointer by 1 px"]
+    fn the_pointer_is_reported_on_exactly_one_display() {
+        let mut seen = Vec::new();
+        for display in DxgiCapturer::displays().unwrap() {
+            let mut capturer = DxgiCapturer::open(&display).unwrap();
+            let _ = capturer.next_frame(Duration::from_millis(100)).unwrap();
+            // DXGI reports the pointer when it changes: nudge it 1 px and back.
+            nudge_pointer();
+            for _ in 0..10 {
+                let _ = capturer.next_frame(Duration::from_millis(50)).unwrap();
+            }
+            let cursor = capturer.cursor().unwrap().clone();
+            if cursor.visible {
+                let shape = cursor.shape.clone().expect("visible pointer has a shape");
+                assert!(shape.width > 0 && shape.height > 0);
+                assert_eq!(shape.rgba.len(), (shape.width * shape.height * 4) as usize);
+                assert!(shape.hot_x < shape.width && shape.hot_y < shape.height);
+                assert!(
+                    shape.rgba.chunks(4).any(|p| p[3] > 0),
+                    "not fully transparent"
+                );
+                assert!((0..display.width as i32).contains(&cursor.x), "{cursor:?}");
+                assert!((0..display.height as i32).contains(&cursor.y), "{cursor:?}");
+                assert!(cursor.serial > 0);
+                seen.push(display.id);
+            }
+        }
+        assert_eq!(seen.len(), 1, "visible on displays {seen:?}");
     }
 
     #[test]

@@ -17,8 +17,11 @@ path = "src/bin/spike-viewer.rs"
 
 [dependencies]
 kanodesk-capture.workspace = true
+kanodesk-client.workspace = true
 kanodesk-codec.workspace = true
 kanodesk-crypto.workspace = true
+kanodesk-host.workspace = true
+kanodesk-input.workspace = true
 kanodesk-proto.workspace = true
 kanodesk-transport.workspace = true
 pollster.workspace = true

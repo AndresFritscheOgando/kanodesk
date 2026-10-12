@@ -56,23 +56,46 @@ enum Modifier {
   MODIFIER_META = 8;
   MODIFIER_CAPS_LOCK = 16;
   MODIFIER_NUM_LOCK = 32;
+  MODIFIER_SCROLL_LOCK = 64;
 }
 
 message KeyEvent {
-  // USB HID usage code (page 0x07) of the physical key.
+  // The physical key as a USB HID usage. Below 0x10000: a usage on the
+  // keyboard page (0x07). Otherwise (page << 16) | usage, e.g. 0x0C00E9 for
+  // Volume Up on the consumer page (0x0C).
   uint32 code = 1;
   bool down = 2;
-  // Bit set of Modifier values held at the time of the event.
+  // Bit set of Modifier values held after the event (Shift, Control, Alt, Meta).
   uint32 modifiers = 3;
   KeyMode mode = 4;
+  // The viewer's Caps/Num/Scroll Lock states (Modifier bits), when it knows
+  // them. The host toggles its own locks to match before applying a key
+  // that is not itself a lock key.
+  optional uint32 locks = 5;
 }
 
-// Text to type as-is (IME output, paste-as-keystrokes).
+// Text to type as-is: characters already resolved by the viewer's layout
+// (Translate mode, IME output, paste as keystrokes).
 message TextInput {
   string text = 1;
 }
 
-// Envelope for client-to-host input.
+// Actions the local OS would not let a viewer send as plain keys (07 §5).
+enum InputAction {
+  INPUT_ACTION_UNSPECIFIED = 0;
+  // The secure attention sequence. Needs the host service (SendSAS).
+  INPUT_ACTION_CTRL_ALT_DEL = 1;
+  INPUT_ACTION_LOCK_SCREEN = 2;
+}
+
+message ActionEvent {
+  InputAction action = 1;
+}
+
+// Envelope for client-to-host input. A message without `msg` is a
+// keep-alive: the viewer sends one every second while it holds keys or
+// buttons, so the host can tell a quiet viewer from a lost one and release
+// what a lost one held.
 message InputMessage {
   // Sequence number, so datagram delivery can drop stale events.
   uint64 seq = 1;
@@ -80,5 +103,6 @@ message InputMessage {
     MouseEvent mouse = 2;
     KeyEvent key = 3;
     TextInput text = 4;
+    ActionEvent action = 5;
   }
 }

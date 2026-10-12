@@ -197,6 +197,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_stream_from_client_to_host() {
+        let identity = Identity::self_signed().unwrap();
+        let server = server(localhost(0), &identity).unwrap();
+        let addr = server.local_addr().unwrap();
+        let host = tokio::spawn(async move {
+            let conn = accept(&server).await.unwrap().unwrap();
+            let mut input = crate::streams::accept_input(&conn).await.unwrap();
+            let mut got = Vec::new();
+            while let Some(msg) = input.next().await.unwrap() {
+                got.push(msg.seq);
+            }
+            got
+        });
+        let client = client(localhost(0), ServerTrust::Pinned(identity.fingerprint())).unwrap();
+        let conn = connect(&client, addr).await.unwrap();
+        let mut input = crate::streams::open_input(&conn).await.unwrap();
+        for seq in 0..3 {
+            input
+                .send(&v1::InputMessage { seq, msg: None })
+                .await
+                .unwrap();
+        }
+        input.into_inner().finish().unwrap();
+        assert_eq!(host.await.unwrap(), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
     async fn channel_binding_matches_per_connection() {
         let identity = Identity::self_signed().unwrap();
         let server = server(localhost(0), &identity).unwrap();

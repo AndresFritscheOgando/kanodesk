@@ -17,7 +17,8 @@
 //! `Ok(None)` until capture resumes. Frame size may change after that, so
 //! always read `width`/`height` from each frame.
 //!
-//! The cursor is **not** drawn into frames; it is sent separately (07).
+//! The cursor is **not** drawn into frames; [`Capturer::cursor`] reports its
+//! position and shape separately (07 §4, [`cursor`]).
 //!
 //! Specified by:
 //! - `docs/06-video-pipeline.md`
@@ -25,8 +26,11 @@
 //! Status: phase 0 spike (see `PROGRESS.md`).
 
 pub mod clock;
+pub mod cursor;
 #[cfg(windows)]
 pub mod dxgi;
+
+pub use cursor::{CursorShape, CursorState};
 
 use std::time::Duration;
 
@@ -119,6 +123,12 @@ pub trait Capturer {
     /// Waits up to `timeout` for a new frame. See the crate docs for the
     /// meaning of `None` and of the `dirty` flag.
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame<'_>>, CaptureError>;
+
+    /// The pointer as of the last [`Self::next_frame`] call, if this backend
+    /// reports it. Compare [`CursorState::serial`] to notice changes.
+    fn cursor(&self) -> Option<&CursorState> {
+        None
+    }
 }
 
 /// Picks the primary display, or the first one if none is marked primary.

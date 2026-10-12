@@ -8,12 +8,14 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+kanodesk-input.workspace = true
 kanodesk-proto.workspace = true
 kanodesk-rendezvous.workspace = true
 kanodesk-transport.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+winit.workspace = true
 
 [dev-dependencies]
 getrandom.workspace = true

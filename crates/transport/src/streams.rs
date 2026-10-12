@@ -2,12 +2,14 @@
 //!
 //! Every stream starts with one `StreamHeader` message and then carries its
 //! envelope type, all framed by `kanodesk_proto::codec`. The client opens the
-//! **control** stream (bidirectional, high priority, `ControlMessage`); the
-//! server opens one **video** stream (unidirectional, `VideoMessage`) per
-//! display.
+//! **control** stream (bidirectional, high priority, `ControlMessage`) and,
+//! once logged in, the **input** stream (unidirectional, highest priority,
+//! `InputMessage`); the server opens one **video** stream (unidirectional,
+//! `VideoMessage`) per display.
 
 use kanodesk_proto::v1::{
-    ControlMessage, RelayMessage, RendezvousMessage, StreamHeader, StreamKind, VideoMessage,
+    ControlMessage, InputMessage, RelayMessage, RendezvousMessage, StreamHeader, StreamKind,
+    VideoMessage,
 };
 use kanodesk_proto::{FrameCodec, MessageReader, MessageWriter, ProtoCodec};
 use quinn::{Connection, RecvStream, SendStream};
@@ -18,6 +20,9 @@ use crate::TransportError;
 pub const CONTROL_PRIORITY: i32 = 10;
 /// Priority for video streams.
 pub const VIDEO_PRIORITY: i32 = 0;
+/// Priority for the input stream: above everything, so a key press never
+/// waits behind queued video or control data.
+pub const INPUT_PRIORITY: i32 = 20;
 
 /// Sends control messages.
 pub type ControlWriter = MessageWriter<SendStream, ControlMessage>;
@@ -189,4 +194,33 @@ pub async fn accept_relay(conn: &Connection) -> Result<(RelayWriter, RelayReader
         )));
     }
     Ok((MessageWriter::new(send), reader.into_typed()))
+}
+
+/// Sends input events.
+pub type InputWriter = MessageWriter<SendStream, InputMessage>;
+/// Receives input events.
+pub type InputReader = MessageReader<RecvStream, InputMessage>;
+
+/// Largest message on the input stream.
+pub const INPUT_MAX_FRAME: usize = 64 * 1024;
+
+/// Client side: opens the input stream (after login).
+pub async fn open_input(conn: &Connection) -> Result<InputWriter, TransportError> {
+    let send = conn.open_uni().await?;
+    set_priority(&send, INPUT_PRIORITY)?;
+    Ok(write_header(send, StreamKind::Input, 0).await?.into_typed())
+}
+
+/// Host side: accepts the client's input stream.
+pub async fn accept_input(conn: &Connection) -> Result<InputReader, TransportError> {
+    let recv = conn.accept_uni().await?;
+    let codec = ProtoCodec::with_frames(FrameCodec::with_max_len(INPUT_MAX_FRAME));
+    let (header, reader) = read_header_with(recv, codec).await?;
+    if header.kind() != StreamKind::Input {
+        return Err(TransportError::BadStreamHeader(format!(
+            "expected an input stream, got {:?}",
+            header.kind()
+        )));
+    }
+    Ok(reader.into_typed())
 }

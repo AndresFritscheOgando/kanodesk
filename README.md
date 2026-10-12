@@ -183,6 +183,16 @@ The viewer logs in before any video flows: a Noise handshake bound to the TLS co
 
 The viewer window shows the host's primary display with a frame counter and latency overlay, and prints per-second stats. Add `--seconds N` to stop after N seconds with a summary, or `--vsync` for Fifo presentation. The latency figure is only meaningful when both run on the same machine. The spike is still a test tool (one viewer at a time, no access control beyond the password); keep it on localhost or a trusted LAN.
 
+#### Controlling the host
+
+Once logged in, the viewer controls the host's mouse and keyboard while its window has focus: clicks, drags, the wheel and keys (by physical position, so the host's keyboard layout decides the characters). Everything held is released when the viewer loses focus or closes, and the host also releases a viewer's keys if it goes quiet for 3 s or disconnects. On the host, `--view-only` starts with input refused; pressing Enter in the host's console toggles between view only and full control (the viewer's overlay shows `VIEW ONLY`).
+
+The viewer's own shortcuts (not sent to the host): **Ctrl+Alt+End** sends Ctrl+Alt+Del (the host performs it once the Windows service exists; until then it reports that it cannot); **Ctrl+Alt+Shift+M** toggles relative mouse (the pointer is locked to the window and raw motion is sent, for games); **Ctrl+Alt+Shift+K** toggles Translate mode, which types characters as your own keyboard layout produces them (useful when the two machines use different layouts; system keys then stay local). In the default Map mode the viewer grabs the keyboard while it has focus, so Win, Alt+Tab, Alt+F4 and Ctrl+Esc go to the host; Ctrl+Alt+Del and Win+L always stay local (Windows handles them below any program). Caps/Num/Scroll Lock act on your machine and the host follows their states. Media keys (volume, play/pause, browser keys) are forwarded.
+
+The host's pointer is shown: while you control, your pointer over the window takes the host's shape; in view-only and relative mode the host's pointer is drawn into the picture. (Windows reports the pointer when it moves, so it appears after the first movement on the host.)
+
+To try it on one machine with two displays, stream the display the viewer is *not* on, for example `spike-host --display 1` and the viewer window on display 0; otherwise the pointer chases itself.
+
 ### Capture benchmark
 
 Captures the primary display, converts to I420 and encodes VP9, then prints fps, per-stage times and bytes per frame. Put something moving on screen first. The flags are listed at the top of `crates/codec/examples/capture_bench.rs`.

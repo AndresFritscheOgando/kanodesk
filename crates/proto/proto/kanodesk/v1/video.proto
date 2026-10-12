@@ -43,10 +43,37 @@ message KeyframeRequest {
   uint32 display = 1;
 }
 
+// A pointer image, sent once per shape and then referred to by `id`.
+message CursorShape {
+  // Host-chosen id, stable for the session (a hash of the image).
+  uint64 id = 1;
+  // Hot spot: the pixel of the image that is the pointer's position.
+  uint32 hot_x = 2;
+  uint32 hot_y = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+  // RGBA, 8 bits per channel, straight alpha, rows top to bottom.
+  bytes rgba = 6;
+}
+
+// Where the pointer is on this display, and which shape it has.
+message CursorPosition {
+  uint32 display = 1;
+  // Pointer position (the hot spot) in display pixels.
+  int32 x = 2;
+  int32 y = 3;
+  // False while the pointer is hidden or on another display.
+  bool visible = 4;
+  // A `CursorShape.id` sent earlier on this stream.
+  uint64 shape = 5;
+}
+
 // Envelope for the server-to-client video stream.
 message VideoMessage {
   oneof msg {
     StreamStart stream_start = 1;
     VideoFrame frame = 2;
+    CursorShape cursor_shape = 3;
+    CursorPosition cursor_position = 4;
   }
 }

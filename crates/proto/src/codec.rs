@@ -393,18 +393,26 @@ mod tests {
                     display: 0,
                 })
             });
-        let key = (any::<u32>(), any::<bool>(), any::<u32>(), 0i32..3).prop_map(
-            |(code, down, modifiers, mode)| {
+        let key = (
+            any::<u32>(),
+            any::<bool>(),
+            any::<u32>(),
+            0i32..3,
+            proptest::option::of(0u32..128),
+        )
+            .prop_map(|(code, down, modifiers, mode, locks)| {
                 input_message::Msg::Key(v1::KeyEvent {
                     code,
                     down,
                     modifiers,
                     mode,
+                    locks,
                 })
-            },
-        );
+            });
         let text = ".{0,64}".prop_map(|text| input_message::Msg::Text(v1::TextInput { text }));
-        (any::<u64>(), prop_oneof![mouse, key, text]).prop_map(|(seq, msg)| InputMessage {
+        let action =
+            (0i32..3).prop_map(|action| input_message::Msg::Action(v1::ActionEvent { action }));
+        (any::<u64>(), prop_oneof![mouse, key, text, action]).prop_map(|(seq, msg)| InputMessage {
             seq,
             msg: Some(msg),
         })

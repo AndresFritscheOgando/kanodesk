@@ -76,6 +76,8 @@ envelope_from!(ControlMessage, control_message,
 envelope_from!(VideoMessage, video_message,
     StreamStart => StreamStart,
     Frame => VideoFrame,
+    CursorShape => CursorShape,
+    CursorPosition => CursorPosition,
 );
 
 #[cfg(test)]
@@ -108,6 +110,10 @@ mod tests {
     fn enum_values_are_stable() {
         // Wire values must never change once shipped.
         assert_eq!(v1::Codec::Vp9 as i32, 1);
+        assert_eq!(v1::Modifier::ScrollLock as i32, 64);
+        assert_eq!(v1::InputAction::CtrlAltDel as i32, 1);
+        assert_eq!(v1::Capability::Cursor as i32, 10);
+        assert_eq!(v1::LoginError::PasswordUsed as i32, 5);
         assert_eq!(v1::StreamKind::Control as i32, 1);
         assert_eq!(v1::StreamKind::Video as i32, 2);
         assert_eq!(v1::Capability::KeyframeRequest as i32, 4);

@@ -17,6 +17,26 @@
 //! `--protocol-version` advertises only that version in `Hello`, to test the
 //! host's handling of incompatible viewers.
 //!
+//! Input (07): while the window has focus, mouse and keyboard go to the
+//! host on the input stream, if the host allows it (it says so with
+//! `Permission` messages; "VIEW ONLY" in the overlay otherwise). Positions
+//! are mapped through the letterbox to the host display's pixels. Keys are
+//! sent by physical position (Map mode); on Windows a keyboard grab sends
+//! Win, Alt+Tab, Alt+F4 and the like to the host too. Lock keys work
+//! locally and the host follows their states. Pointer moves are coalesced
+//! to one per frame. Everything held is released when the window loses
+//! focus or closes. Input that a host on this same machine injected is
+//! recognised and not sent back (no feedback loop on one machine).
+//!
+//! Shortcuts (not sent): Ctrl+Alt+End sends Ctrl+Alt+Del; Ctrl+Alt+Shift+M
+//! toggles relative mouse (pointer locked, raw motion, for games);
+//! Ctrl+Alt+Shift+K toggles Translate mode (characters as this keyboard
+//! types them; system keys then stay local).
+//!
+//! The host's pointer: while controlling, this window's pointer takes the
+//! host's shape; in view-only and relative modes the host's pointer is drawn
+//! into the picture where the host reports it.
+//!
 //! Threads: the window/render loop (main), the QUIC client (tokio), and a
 //! decoder. Decoded frames go through a one-slot "latest frame" mailbox, so
 //! the window always shows the newest frame and never builds a queue.
@@ -25,14 +45,22 @@
 //! image (both QPC, so same machine only). Printed every second, as a summary
 //! at exit, and drawn in the overlay.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kanodesk_capture::clock;
+use kanodesk_client::cursor::{CursorMode, RemoteCursor, cursor_mode, scale_shape};
+use kanodesk_client::input::{
+    KeyInput, KeyOutcome, KeyboardMode, SendOptions, ViewMapping, ViewerCommand, ViewerInput,
+    send_input,
+};
 use kanodesk_codec::{Decoder, I420Frame, Vp9Decoder};
 use kanodesk_crypto::{DeviceIdentity, DevicePublicKey};
+use kanodesk_input::grab::{GrabbedKey, KeyboardGrab};
+use kanodesk_input::{Action, InputEvent, Permissions};
 use kanodesk_proto::v1::{self, ControlMessage, control_message, video_message};
 use kanodesk_spike::render::SurfaceRenderer;
 use kanodesk_spike::stats::{Samples, ms_between};
@@ -46,9 +74,9 @@ use kanodesk_transport::tls::{Fingerprint, ServerTrust};
 use tokio::sync::mpsc as tokio_mpsc;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, CursorIcon, CustomCursor, Window, WindowId};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -174,7 +202,26 @@ enum UserEvent {
     FrameReady,
     Tick,
     Failed(String),
+    /// The host's displays (from `Displays`).
+    Displays(Vec<v1::DisplayInfo>),
+    /// The host changed what this viewer may do.
+    Permission(v1::Permission),
+    /// The video stream shows this host display.
+    VideoDisplay(u32),
+    /// A key from the keyboard grab.
+    Grabbed(GrabbedKey),
+    /// A host pointer image.
+    CursorShape(v1::CursorShape),
+    /// Where the host's pointer is.
+    CursorPosition(v1::CursorPosition),
 }
+
+/// Input from the window thread to the input stream.
+type InputTx = tokio_mpsc::UnboundedSender<InputEvent>;
+type InputRx = tokio_mpsc::UnboundedReceiver<InputEvent>;
+/// The input-stream task, so shutdown can let it flush its last releases.
+type InputTask =
+    Arc<Mutex<Option<tokio::task::JoinHandle<Result<u64, kanodesk_transport::TransportError>>>>>;
 
 fn main() {
     let args = match parse_args() {
@@ -201,6 +248,7 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let mailbox = Arc::new(Mailbox::default());
     let (control_tx, control_rx) = tokio_mpsc::unbounded_channel::<ControlMessage>();
+    let (input_tx, input_rx) = tokio_mpsc::unbounded_channel::<InputEvent>();
 
     let (shutdown, network_thread) = spawn_network(
         args.addr,
@@ -211,6 +259,7 @@ fn main() {
         proxy.clone(),
         control_tx,
         control_rx,
+        input_rx,
     );
     {
         let proxy = proxy.clone();
@@ -221,10 +270,12 @@ fn main() {
         });
     }
 
-    let mut app = App::new(args, mailbox);
+    let mut app = App::new(args, mailbox, input_tx, proxy.clone());
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("spike-viewer: {e}");
     }
+    // Release anything still held and end the input stream before closing.
+    app.finish_input();
     app.print_summary();
     // Close the connection properly so the host frees its capture at once.
     let _ = shutdown.send(());
@@ -259,11 +310,13 @@ fn spawn_network(
     proxy: EventLoopProxy<UserEvent>,
     control_tx: tokio_mpsc::UnboundedSender<ControlMessage>,
     control_rx: tokio_mpsc::UnboundedReceiver<ControlMessage>,
+    input_rx: InputRx,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
     std::thread::JoinHandle<()>,
 ) {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let input_task: InputTask = Arc::default();
     let thread = std::thread::spawn(move || {
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
@@ -288,11 +341,19 @@ fn spawn_network(
                 proxy.clone(),
                 control_tx,
                 control_rx,
+                input_rx,
+                input_task.clone(),
             );
             let result = tokio::select! {
                 r = session => r,
                 _ = shutdown_rx => Ok(()),
             };
+            // The window has sent its last releases and dropped its sender;
+            // let the input stream deliver them before the connection closes.
+            let input = input_task.lock().unwrap().take();
+            if let Some(input) = input {
+                let _ = tokio::time::timeout(Duration::from_millis(500), input).await;
+            }
             endpoint::shutdown(&client, b"viewer closed").await;
             result
         });
@@ -315,6 +376,8 @@ async fn network(
     proxy: EventLoopProxy<UserEvent>,
     control_tx: tokio_mpsc::UnboundedSender<ControlMessage>,
     mut control_rx: tokio_mpsc::UnboundedReceiver<ControlMessage>,
+    input_rx: InputRx,
+    input_task: InputTask,
 ) -> Result<(), BoxError> {
     let conn = endpoint::connect(client, addr).await?;
     println!("connected to {addr}");
@@ -340,7 +403,17 @@ async fn network(
         negotiated.capabilities
     );
 
-    // Sealed control loop: forward the decoder's messages, report a Close.
+    // Input goes on its own stream, opened now that we are logged in.
+    {
+        let conn = conn.clone();
+        let task =
+            tokio::spawn(async move { send_input(&conn, input_rx, SendOptions::default()).await });
+        *input_task.lock().unwrap() = Some(task);
+    }
+
+    // Sealed control loop: forward the decoder's messages; pass displays and
+    // permissions to the window; report a Close.
+    let ui = proxy.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -359,6 +432,16 @@ async fn network(
                         eprintln!("host closed the session: {:?} {}", c.reason(), c.detail);
                         break;
                     }
+                    Ok(Some(ControlMessage {
+                        msg: Some(control_message::Msg::Displays(d)),
+                    })) => {
+                        let _ = ui.send_event(UserEvent::Displays(d.displays));
+                    }
+                    Ok(Some(ControlMessage {
+                        msg: Some(control_message::Msg::Permission(p)),
+                    })) => {
+                        let _ = ui.send_event(UserEvent::Permission(p));
+                    }
                     Ok(Some(_)) => {}
                     Ok(None) | Err(_) => break,
                 },
@@ -370,6 +453,8 @@ async fn network(
         display,
         mut reader,
     } = streams::accept_uni(&conn).await?;
+    let _ = proxy.send_event(UserEvent::VideoDisplay(display));
+    let cursor_ui = proxy.clone();
     // Ask for a keyframe straight away.
     control_tx.send(v1::KeyframeRequest { display }.into())?;
 
@@ -392,6 +477,12 @@ async fn network(
                 if frames_tx.send((frame, received_us)).is_err() {
                     break;
                 }
+            }
+            Some(video_message::Msg::CursorShape(shape)) => {
+                let _ = cursor_ui.send_event(UserEvent::CursorShape(shape));
+            }
+            Some(video_message::Msg::CursorPosition(position)) => {
+                let _ = cursor_ui.send_event(UserEvent::CursorPosition(position));
             }
             None => {}
         }
@@ -511,10 +602,32 @@ struct App {
     /// Last complete second: fps, latency avg, latency p95.
     shown: (f64, f64, f64),
     failed: bool,
+    input: ViewerInput,
+    /// `None` once the input stream has been ended.
+    input_tx: Option<InputTx>,
+    displays: Vec<v1::DisplayInfo>,
+    display: Option<u32>,
+    view: Option<ViewMapping>,
+    proxy: EventLoopProxy<UserEvent>,
+    /// Sends system keys to the host while focused (Windows, Map mode).
+    grab: Option<KeyboardGrab>,
+    focused: bool,
+    cursor: RemoteCursor,
+    /// Host shape (id, scale in %) currently set as this window's pointer.
+    local_cursor: Option<(u64, u32)>,
+    custom_cursors: HashMap<(u64, u32), CustomCursor>,
+    /// Host shape uploaded to the renderer, and where it was last drawn.
+    drawn_shape: Option<u64>,
+    drawn_at: Option<(f32, f32)>,
 }
 
 impl App {
-    fn new(args: Args, mailbox: Arc<Mailbox>) -> Self {
+    fn new(
+        args: Args,
+        mailbox: Arc<Mailbox>,
+        input_tx: InputTx,
+        proxy: EventLoopProxy<UserEvent>,
+    ) -> Self {
         App {
             args,
             mailbox,
@@ -530,7 +643,232 @@ impl App {
             overlay: "WAITING FOR HOST".into(),
             shown: (0.0, 0.0, 0.0),
             failed: false,
+            input: ViewerInput::new(),
+            input_tx: Some(input_tx),
+            displays: Vec::new(),
+            display: None,
+            view: None,
+            proxy,
+            grab: None,
+            focused: false,
+            cursor: RemoteCursor::new(),
+            local_cursor: None,
+            custom_cursors: HashMap::new(),
+            drawn_shape: None,
+            drawn_at: None,
         }
+    }
+
+    /// Modes shown in the overlay.
+    fn mode_label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.input.permissions() == Permissions::NONE {
+            parts.push("VIEW ONLY");
+        }
+        if self.input.relative_mouse() {
+            parts.push("RELATIVE MOUSE");
+        }
+        if self.input.keyboard_mode() == KeyboardMode::Translate {
+            parts.push("TRANSLATE");
+        }
+        parts.iter().map(|p| format!("{p}  ")).collect()
+    }
+
+    /// The keyboard grab runs while focused, in Map mode, with keyboard allowed.
+    fn update_grab(&self) {
+        if let Some(grab) = &self.grab {
+            let active = self.focused
+                && self.input.keyboard_mode() == KeyboardMode::Map
+                && self.input.permissions().keyboard;
+            if active != grab.is_active() {
+                println!(
+                    "keyboard grab {}",
+                    if active {
+                        "on (system keys go to the host)"
+                    } else {
+                        "off"
+                    }
+                );
+            }
+            grab.set_active(active);
+        }
+    }
+
+    fn grabbing(&self) -> bool {
+        self.grab.as_ref().is_some_and(|g| g.is_active())
+    }
+
+    /// Locks or frees the pointer for relative mode.
+    fn apply_pointer_lock(&self) {
+        let Some(w) = &self.window else { return };
+        if self.input.relative_mouse() && self.focused {
+            let _ = w
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined));
+            w.set_cursor_visible(false);
+        } else {
+            let _ = w.set_cursor_grab(CursorGrabMode::None);
+            w.set_cursor_visible(true);
+        }
+    }
+
+    fn handle_key(&mut self, event_loop: &ActiveEventLoop, outcome: KeyOutcome) {
+        self.send(outcome.events);
+        let Some(command) = outcome.command else {
+            return;
+        };
+        match command {
+            ViewerCommand::CtrlAltDel => {
+                if self.input.permissions().keyboard {
+                    self.send([InputEvent::Action(Action::CtrlAltDel)]);
+                    println!("sent Ctrl+Alt+Del (the host performs it once its service exists)");
+                }
+            }
+            ViewerCommand::ToggleRelativeMouse => {
+                let on = !self.input.relative_mouse();
+                self.input.set_relative_mouse(on);
+                self.apply_pointer_lock();
+                println!("relative mouse {}", if on { "on" } else { "off" });
+            }
+            ViewerCommand::ToggleKeyboardMode => {
+                let mode = match self.input.keyboard_mode() {
+                    KeyboardMode::Map => KeyboardMode::Translate,
+                    KeyboardMode::Translate => KeyboardMode::Map,
+                };
+                self.input.set_keyboard_mode(mode);
+                self.update_grab();
+                println!("keyboard mode {mode:?}");
+            }
+        }
+        self.refresh_cursor(event_loop);
+    }
+
+    /// Window pixels per host display pixel.
+    fn view_scale(&self) -> f32 {
+        self.view
+            .and_then(|v| {
+                v.video_rect()
+                    .map(|(_, _, w, _)| w / v.display.0.max(1) as f64)
+            })
+            .unwrap_or(1.0) as f32
+    }
+
+    /// Shows the host's pointer the way the current mode wants it.
+    fn refresh_cursor(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        match cursor_mode(self.input.permissions(), self.input.relative_mouse()) {
+            CursorMode::Local => {
+                if self.drawn_at.take().is_some() {
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.set_cursor_position(None);
+                    }
+                    window.request_redraw();
+                }
+                let Some(shape) = self.cursor.shape() else {
+                    return;
+                };
+                let scale = self.view_scale();
+                let key = (shape.id, (scale * 100.0).round() as u32);
+                if self.local_cursor == Some(key) {
+                    return;
+                }
+                let cursor = match self.custom_cursors.get(&key) {
+                    Some(c) => c.clone(),
+                    None => {
+                        let (rgba, w, h, hot) = scale_shape(shape, scale, 256);
+                        let Ok(source) = CustomCursor::from_rgba(
+                            rgba,
+                            w as u16,
+                            h as u16,
+                            hot.0 as u16,
+                            hot.1 as u16,
+                        ) else {
+                            return;
+                        };
+                        if self.custom_cursors.len() >= 64 {
+                            self.custom_cursors.clear();
+                        }
+                        let c = event_loop.create_custom_cursor(source);
+                        self.custom_cursors.insert(key, c.clone());
+                        c
+                    }
+                };
+                window.set_cursor(cursor);
+                self.local_cursor = Some(key);
+            }
+            CursorMode::Drawn => {
+                if self.local_cursor.take().is_some() {
+                    window.set_cursor(CursorIcon::Default);
+                }
+                // Host display pixels → video pixels.
+                let k = self
+                    .view
+                    .map_or(1.0, |v| v.video.0 as f32 / v.display.0.max(1) as f32);
+                let drawn = self
+                    .display
+                    .and_then(|d| self.cursor.drawn_on(d))
+                    .map(|(shape, pos)| (shape.clone(), pos));
+                let at = drawn
+                    .as_ref()
+                    .map(|(_, (x, y))| (*x as f32 * k, *y as f32 * k));
+                let Some(r) = self.renderer.as_mut() else {
+                    return;
+                };
+                if let Some((shape, _)) = &drawn
+                    && self.drawn_shape != Some(shape.id)
+                {
+                    r.set_cursor_image(&shape.rgba, (shape.width, shape.height), shape.hot, k);
+                    self.drawn_shape = Some(shape.id);
+                }
+                if at != self.drawn_at {
+                    r.set_cursor_position(at);
+                    self.drawn_at = at;
+                    window.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// Recomputes the window → host display mapping.
+    fn update_view(&mut self) {
+        let (Some(window), Some(display)) = (&self.window, self.display) else {
+            return;
+        };
+        if self.video_size.0 == 0 {
+            return;
+        }
+        let size = window.inner_size();
+        let display_size = self
+            .displays
+            .iter()
+            .find(|d| d.id == display)
+            .map_or(self.video_size, |d| (d.width, d.height));
+        let view = ViewMapping {
+            window: (size.width, size.height),
+            video: self.video_size,
+            display: display_size,
+        };
+        self.view = Some(view);
+        self.input.set_view(display, view);
+    }
+
+    fn send(&self, events: impl IntoIterator<Item = InputEvent>) {
+        if let Some(tx) = &self.input_tx {
+            for e in events {
+                let _ = tx.send(e);
+            }
+        }
+    }
+
+    /// Releases everything held and ends the input stream (closing).
+    fn finish_input(&mut self) {
+        let releases = self.input.release_all();
+        self.send(releases);
+        self.input_tx = None;
+        // Give the system its keys back at once.
+        self.grab = None;
     }
 
     fn show_frame(&mut self) {
@@ -541,13 +879,22 @@ impl App {
             return;
         };
         self.frame_count += 1;
-        self.video_size = (decoded.frame.width(), decoded.frame.height());
+        let size = (decoded.frame.width(), decoded.frame.height());
+        let resized = size != self.video_size;
+        self.video_size = size;
         renderer.upload(&decoded.frame);
         let (fps, avg, p95) = self.shown;
+        let mode = self.mode_label();
         self.overlay = format!(
-            "FRAME {}  LAT {avg:.1} MS  P95 {p95:.1}  FPS {fps:.1}  {}X{}",
+            "{mode}FRAME {}  LAT {avg:.1} MS  P95 {p95:.1}  FPS {fps:.1}  {}X{}",
             decoded.times.seq, self.video_size.0, self.video_size.1
         );
+        if resized {
+            self.update_view();
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
         if !renderer.render(&self.overlay) {
             return;
         }
@@ -576,9 +923,15 @@ impl App {
         self.second = Timings::default();
         self.second_start = Instant::now();
 
-        if let (Some(limit), Some(start)) = (self.args.seconds, self.total_start)
+        // Counted from the end of the warm-up, even if a static screen sends
+        // no further frames.
+        let start = self
+            .total_start
+            .or_else(|| self.first_frame.map(|f| f + WARMUP));
+        if let (Some(limit), Some(start)) = (self.args.seconds, start)
             && start.elapsed() >= Duration::from_secs(limit)
         {
+            self.finish_input();
             event_loop.exit();
         }
     }
@@ -607,6 +960,25 @@ impl App {
             "  frames skipped by the mailbox: {}",
             self.mailbox.replaced.lock().unwrap()
         );
+    }
+}
+
+impl App {
+    /// Installs the keyboard grab for `window` (Windows only).
+    fn install_grab(&mut self, window: &Window) {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let hwnd = window.window_handle().ok().and_then(|h| match h.as_raw() {
+            RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
+            _ => None,
+        });
+        let Some(hwnd) = hwnd else { return };
+        let proxy = self.proxy.clone();
+        match KeyboardGrab::install(hwnd, move |key| {
+            let _ = proxy.send_event(UserEvent::Grabbed(key));
+        }) {
+            Ok(grab) => self.grab = Some(grab),
+            Err(e) => eprintln!("keyboard grab unavailable ({e}); system keys stay local"),
+        }
     }
 }
 
@@ -639,12 +1011,38 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         }
+        self.install_grab(&window);
         self.window = Some(window);
     }
 
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        // Raw motion drives relative mode (the pointer itself is locked).
+        if let DeviceEvent::MouseMotion { delta } = event
+            && self.focused
+        {
+            let e = self.input.mouse_motion(delta.0, delta.1);
+            self.send(e);
+        }
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // A host on this same machine injects into whatever has focus, which
+        // may be this window: never send such input back.
+        let injected_here = matches!(
+            event,
+            WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::KeyboardInput { .. }
+        ) && kanodesk_input::is_own_injection();
+        if injected_here {
+            return;
+        }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.finish_input();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(r) = self.renderer.as_mut() {
                     r.resize(size.width, size.height);
@@ -652,6 +1050,46 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
+                self.update_view();
+                self.refresh_cursor(event_loop);
+            }
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                self.update_grab();
+                self.apply_pointer_lock();
+                if !focused {
+                    let releases = self.input.release_all();
+                    self.send(releases);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let e = self.input.cursor_moved((position.x, position.y));
+                self.send(e);
+            }
+            WindowEvent::CursorLeft { .. } => self.input.cursor_left(),
+            WindowEvent::MouseInput { state, button, .. } => {
+                let e = self.input.mouse_button(button, state.is_pressed());
+                self.send(e);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let e = self.input.wheel(delta);
+                self.send(e);
+            }
+            // Synthetic events are winit's guesses on focus changes; focus
+            // loss is handled above, so they are ignored.
+            // While the keyboard grab runs, keys arrive through it instead.
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } if !self.grabbing() => {
+                let outcome = self.input.key(
+                    event.physical_key,
+                    event.state.is_pressed(),
+                    event.text.as_deref(),
+                    kanodesk_input::local_lock_state(),
+                );
+                self.handle_key(event_loop, outcome);
             }
             WindowEvent::RedrawRequested => {
                 if let Some(r) = self.renderer.as_mut() {
@@ -664,12 +1102,76 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::FrameReady => self.show_frame(),
+            UserEvent::FrameReady => {
+                let size = self.video_size;
+                self.show_frame();
+                if self.video_size != size {
+                    self.refresh_cursor(event_loop);
+                }
+            }
             UserEvent::Tick => self.tick(event_loop),
             UserEvent::Failed(reason) => {
                 eprintln!("connection: {reason}");
                 self.failed = self.total_start.is_none();
+                self.finish_input();
                 event_loop.exit();
+            }
+            UserEvent::Displays(displays) => {
+                for d in &displays {
+                    println!(
+                        "host display {}: {}x{} at ({}, {}){}",
+                        d.id,
+                        d.width,
+                        d.height,
+                        d.x,
+                        d.y,
+                        if d.primary { ", primary" } else { "" }
+                    );
+                }
+                self.displays = displays;
+                self.update_view();
+                self.refresh_cursor(event_loop);
+            }
+            UserEvent::Permission(p) => {
+                let before = self.input.permissions();
+                let now = before.with(&p);
+                let said = |on: bool| if on { "allowed" } else { "not allowed" };
+                if now.keyboard != before.keyboard {
+                    println!("host: keyboard {}", said(now.keyboard));
+                }
+                if now.mouse != before.mouse {
+                    println!("host: mouse {}", said(now.mouse));
+                }
+                self.input.set_permissions(now);
+                self.update_grab();
+                self.refresh_cursor(event_loop);
+            }
+            UserEvent::VideoDisplay(id) => {
+                self.display = Some(id);
+                self.update_view();
+                self.refresh_cursor(event_loop);
+            }
+            UserEvent::Grabbed(key) => {
+                let outcome = self.input.key_input(KeyInput {
+                    code: key.code,
+                    down: key.down,
+                    text: None,
+                    locks: kanodesk_input::local_lock_state(),
+                });
+                self.handle_key(event_loop, outcome);
+            }
+            UserEvent::CursorShape(shape) => {
+                if self.cursor.add_shape(&shape) {
+                    println!(
+                        "host pointer shape {}x{} (hot spot {}, {})",
+                        shape.width, shape.height, shape.hot_x, shape.hot_y
+                    );
+                }
+                self.refresh_cursor(event_loop);
+            }
+            UserEvent::CursorPosition(position) => {
+                self.cursor.set_position(&position);
+                self.refresh_cursor(event_loop);
             }
         }
     }

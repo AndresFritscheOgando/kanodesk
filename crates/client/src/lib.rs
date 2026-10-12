@@ -7,18 +7,28 @@
 //! Specified by:
 //! - `docs/05-wire-protocol.md`
 //! - `docs/02-architecture.md`
+//! - `docs/07-input-control.md`
 //!
 //! - [`connect`]: how a controller reaches a host: LAN, then a direct punch
 //!   (IPv4 and IPv6), then the relay, logging which path won.
+//! - [`cursor`]: the host's pointer (shapes, position, local or drawn).
+//! - [`input`]: viewer-side input: window → display mapping, key codes,
+//!   held-key tracking, move coalescing and the input stream (07).
 //!
-//! Status: connection strategy done; session, decode and input come next.
+//! Status: connection strategy and input done; session and decode come next.
 
 pub mod connect;
+pub mod cursor;
+pub mod input;
 
 pub use connect::{ConnectOptions, ConnectPlan, Established, PathKind, connect};
 
 /// Spec documents, relative to the workspace root, that describe this crate's behaviour.
-pub const SPEC_DOCS: &[&str] = &["docs/05-wire-protocol.md", "docs/02-architecture.md"];
+pub const SPEC_DOCS: &[&str] = &[
+    "docs/05-wire-protocol.md",
+    "docs/02-architecture.md",
+    "docs/07-input-control.md",
+];
 
 #[cfg(test)]
 mod tests {

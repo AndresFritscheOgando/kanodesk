@@ -40,6 +40,12 @@ enum Capability {
   CAPABILITY_INPUT_KEYBOARD = 7;
   CAPABILITY_MULTI_DISPLAY = 8;
   CAPABILITY_SET_RESOLUTION = 9;
+  // Sends `CursorShape`/`CursorPosition` on video streams (the pointer is not
+  // drawn into the frames).
+  CAPABILITY_CURSOR = 10;
+  // Accepts `TextInput` (Translate mode) and relative mouse moves.
+  CAPABILITY_INPUT_TEXT = 11;
+  CAPABILITY_INPUT_RELATIVE_MOUSE = 12;
 }
 
 message Hello {

@@ -40,7 +40,15 @@ pub const SPEC_DOCS: &[&str] = &["docs/16-clone-blueprint.md", "docs/06-video-pi
 pub const DEFAULT_ADDR: &str = "127.0.0.1:9000";
 
 /// Capabilities the spike host and viewer both announce.
-pub const SPIKE_CAPABILITIES: &[Capability] = &[Capability::VideoVp9, Capability::KeyframeRequest];
+pub const SPIKE_CAPABILITIES: &[Capability] = &[
+    Capability::VideoVp9,
+    Capability::KeyframeRequest,
+    Capability::InputMouse,
+    Capability::InputKeyboard,
+    Capability::InputText,
+    Capability::InputRelativeMouse,
+    Capability::Cursor,
+];
 
 /// The `Hello` both spike binaries send.
 pub fn spike_hello() -> Hello {

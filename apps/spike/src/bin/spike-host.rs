@@ -3,7 +3,7 @@
 //! ```text
 //! spike-host [--listen 127.0.0.1:9000] [--fps 30] [--bitrate KBPS] [--speed 6] [--display N]
 //!            [--data-dir DIR] [--password-length 8] [--set-permanent PASSWORD | --clear-permanent]
-//!            [--reset-login-limits]
+//!            [--reset-login-limits] [--view-only]
 //! ```
 //!
 //! Prints its device key and a temporary password; the viewer needs both
@@ -15,6 +15,12 @@
 //! (`--reset-login-limits` forgets them). The device key (and any permanent
 //! password) is kept DPAPI-protected in `--data-dir`.
 //! Each viewer gets its own capture and encoder (16 §4, per-viewer encoder).
+//!
+//! After login the viewer may control this machine's keyboard and mouse
+//! (07): input arrives on its own stream and is injected with `SendInput`.
+//! `--view-only` starts with input refused; pressing Enter in this console
+//! toggles it for the current and later viewers. Everything the viewer holds
+//! is released when it disconnects or loses the permission.
 
 #[cfg(windows)]
 fn main() {
@@ -37,13 +43,17 @@ mod host {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use kanodesk_capture::{Capturer, DisplayInfo, PlatformCapturer, clock, primary_display};
+    use kanodesk_capture::{
+        Capturer, CursorState, DisplayInfo, PlatformCapturer, clock, primary_display,
+    };
     use kanodesk_codec::{Encoder, EncoderConfig, I420Frame, Vp9Encoder, convert};
     use kanodesk_crypto::password::{
         Charset, DEFAULT_TEMPORARY_LEN, HostPasswords, TemporaryPolicy,
     };
     use kanodesk_crypto::throttle::{self, LoginThrottle, ThrottleConfig};
     use kanodesk_crypto::{DeviceIdentity, PasswordKind};
+    use kanodesk_host::input::{HOLD_TIMEOUT, serve_input};
+    use kanodesk_input::{DisplayRect, Injector, Permissions};
     use kanodesk_proto::v1::{self, Capability, CloseReason, Codec, VideoMessage, control_message};
     use kanodesk_spike::stats::Samples;
     use kanodesk_spike::{
@@ -54,7 +64,7 @@ mod host {
     };
     use kanodesk_transport::tls::Identity;
     use kanodesk_transport::{Connection, RecvStream, SendStream, endpoint, streams};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
 
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -70,6 +80,7 @@ mod host {
         /// `Some(Some(p))` sets the permanent password, `Some(None)` clears it.
         permanent: Option<Option<String>>,
         reset_login_limits: bool,
+        view_only: bool,
     }
 
     /// Login failures, backoffs and bans, kept across restarts (in the data dir).
@@ -114,6 +125,7 @@ mod host {
             password_length: DEFAULT_TEMPORARY_LEN,
             permanent: None,
             reset_login_limits: false,
+            view_only: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -130,6 +142,7 @@ mod host {
                 "--set-permanent" => s.permanent = Some(Some(value()?)),
                 "--clear-permanent" => s.permanent = Some(None),
                 "--reset-login-limits" => s.reset_login_limits = true,
+                "--view-only" => s.view_only = true,
                 other => return Err(format!("unknown argument {other}")),
             }
         }
@@ -168,6 +181,14 @@ mod host {
             throttle: Mutex::new(throttle::load(&throttle_path, ThrottleConfig::default())),
             throttle_path,
         });
+
+        let permissions = watch::Sender::new(if settings.view_only {
+            Permissions::NONE
+        } else {
+            Permissions::ALL
+        });
+        describe_input(*permissions.borrow());
+        toggle_input_on_enter(permissions.clone());
 
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
@@ -215,10 +236,11 @@ mod host {
                 }
                 let settings = settings.clone();
                 let session_conn = conn.clone();
+                let allowed = permissions.subscribe();
                 let task = tokio::spawn(async move {
                     let peer = session_conn.remote_address();
                     let watched = session_conn.clone();
-                    match serve(session_conn, session, settings).await {
+                    match serve(session_conn, session, settings, allowed).await {
                         Ok(()) => println!("viewer {peer} done"),
                         Err(_) if endpoint::closed_by_peer(&watched) => {
                             println!("viewer {peer} disconnected")
@@ -301,21 +323,120 @@ mod host {
         let _ = ready.send((conn, session)).await;
     }
 
-    fn pick_display(settings: &Settings) -> Result<DisplayInfo, BoxError> {
-        let displays = PlatformCapturer::displays()?;
+    fn describe_input(p: Permissions) {
+        if p == Permissions::NONE {
+            println!("input: view only (press Enter to allow keyboard and mouse)");
+        } else {
+            println!("input: keyboard and mouse allowed (press Enter for view only)");
+        }
+    }
+
+    /// Enter in this console toggles between full input and view only.
+    fn toggle_input_on_enter(permissions: watch::Sender<Permissions>) {
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            while matches!(std::io::stdin().read_line(&mut line), Ok(n) if n > 0) {
+                line.clear();
+                let next = if *permissions.borrow() == Permissions::NONE {
+                    Permissions::ALL
+                } else {
+                    Permissions::NONE
+                };
+                permissions.send_replace(next);
+                describe_input(next);
+            }
+        });
+    }
+
+    fn pick_display(
+        displays: &[DisplayInfo],
+        settings: &Settings,
+    ) -> Result<DisplayInfo, BoxError> {
         let found = match settings.display {
             Some(id) => displays.iter().find(|d| d.id == id),
-            None => primary_display(&displays),
+            None => primary_display(displays),
         };
         Ok(found.ok_or("display not found")?.clone())
     }
 
+    /// The host's displays as sent to the viewer.
+    fn displays_message(displays: &[DisplayInfo]) -> v1::Displays {
+        v1::Displays {
+            displays: displays
+                .iter()
+                .map(|d| v1::DisplayInfo {
+                    id: d.id,
+                    name: d.name.clone(),
+                    x: d.x,
+                    y: d.y,
+                    width: d.width,
+                    height: d.height,
+                    primary: d.primary,
+                    scale_percent: 0,
+                })
+                .collect(),
+        }
+    }
+
+    /// Applies the viewer's input stream until it ends; everything held is
+    /// released then (and if this task is aborted, when the injector drops).
+    async fn input_service(
+        conn: Connection,
+        displays: Vec<DisplayInfo>,
+        mut allowed: watch::Receiver<Permissions>,
+    ) -> Result<(), BoxError> {
+        let mut reader = streams::accept_input(&conn).await?;
+        let rects = displays
+            .iter()
+            .map(|d| DisplayRect {
+                id: d.id,
+                x: d.x,
+                y: d.y,
+                width: d.width,
+                height: d.height,
+            })
+            .collect();
+        let mut injector =
+            Injector::new(kanodesk_input::platform_sink()?, rects, Permissions::NONE);
+        let result = serve_input(&mut reader, &mut injector, &mut allowed, HOLD_TIMEOUT).await;
+        if let Ok(stats) = &result {
+            println!(
+                "input: {} events injected, {} dropped, {} refused by Windows, {} quiet releases",
+                stats.injected, stats.dropped, stats.failed, stats.quiet_releases
+            );
+        }
+        result?;
+        Ok(())
+    }
+
     /// Serves one logged-in viewer: capture thread → channel → video stream,
-    /// and sealed control stream → keyframe flag.
-    async fn serve(conn: Connection, session: Session, settings: Settings) -> Result<(), BoxError> {
+    /// sealed control stream (keyframe requests in; displays and permissions
+    /// out), and the input stream.
+    async fn serve(
+        conn: Connection,
+        session: Session,
+        settings: Settings,
+        mut allowed: watch::Receiver<Permissions>,
+    ) -> Result<(), BoxError> {
+        // Viewers that understand cursor messages get the pointer separately.
+        let send_cursor = session.negotiated.has(Capability::Cursor);
         let mut control_stream = session.control;
 
-        let display = pick_display(&settings)?;
+        let displays = PlatformCapturer::displays()?;
+        let display = pick_display(&displays, &settings)?;
+        // Tell the viewer where things are and what it may do.
+        control_stream
+            .send(&displays_message(&displays).into())
+            .await?;
+        let now = *allowed.borrow_and_update();
+        for p in now.to_proto() {
+            control_stream.send(&p.into()).await?;
+        }
+        let input = tokio::spawn(input_service(
+            conn.clone(),
+            displays.clone(),
+            allowed.clone(),
+        ));
         let keyframe = Arc::new(AtomicBool::new(true));
         let (frames_tx, mut frames_rx) = mpsc::channel::<VideoMessage>(4);
 
@@ -325,7 +446,9 @@ mod host {
             std::thread::Builder::new()
                 .name(format!("capture {}", display.name))
                 .spawn(move || {
-                    if let Err(e) = capture_loop(&display, &settings, &frames_tx, &keyframe) {
+                    if let Err(e) =
+                        capture_loop(&display, &settings, &frames_tx, &keyframe, send_cursor)
+                    {
                         eprintln!("capture loop: {e}");
                     }
                 })?
@@ -334,16 +457,30 @@ mod host {
         let control = {
             let keyframe = keyframe.clone();
             tokio::spawn(async move {
-                while let Some(msg) = control_stream.recv().await? {
-                    match msg.msg {
-                        Some(control_message::Msg::KeyframeRequest(_)) => {
-                            keyframe.store(true, Ordering::Relaxed)
+                let mut watching = true;
+                loop {
+                    tokio::select! {
+                        msg = control_stream.recv() => match msg?.and_then(|m| m.msg) {
+                            Some(control_message::Msg::KeyframeRequest(_)) => {
+                                keyframe.store(true, Ordering::Relaxed)
+                            }
+                            Some(control_message::Msg::Close(c)) => {
+                                println!("viewer closed: {:?} {}", c.reason(), c.detail);
+                                break;
+                            }
+                            Some(_) => {}
+                            None => break,
+                        },
+                        changed = allowed.changed(), if watching => {
+                            if changed.is_err() {
+                                watching = false;
+                                continue;
+                            }
+                            let now = *allowed.borrow_and_update();
+                            for p in now.to_proto() {
+                                control_stream.send(&p.into()).await?;
+                            }
                         }
-                        Some(control_message::Msg::Close(c)) => {
-                            println!("viewer closed: {:?} {}", c.reason(), c.detail);
-                            break;
-                        }
-                        _ => {}
                     }
                 }
                 Ok::<_, BoxError>(())
@@ -362,19 +499,65 @@ mod host {
         // Dropping the receiver stops the capture thread at its next send.
         drop(frames_rx);
         control.abort();
+        // Normally the input stream has already ended with the connection;
+        // aborting drops the injector, which releases anything still held.
+        input.abort();
+        if let Ok(Err(e)) = input.await {
+            println!("input: {e}");
+        }
         let _ = tokio::task::spawn_blocking(move || capture.join()).await;
         result
     }
 
+    /// The messages that bring a viewer up to date with `cursor`: its shape
+    /// (once per shape) and its position.
+    fn cursor_messages(
+        display: u32,
+        cursor: &CursorState,
+        sent_shapes: &mut std::collections::HashSet<u64>,
+    ) -> Vec<VideoMessage> {
+        let mut out = Vec::new();
+        if let Some(shape) = &cursor.shape
+            && sent_shapes.insert(shape.id)
+        {
+            out.push(
+                v1::CursorShape {
+                    id: shape.id,
+                    hot_x: shape.hot_x,
+                    hot_y: shape.hot_y,
+                    width: shape.width,
+                    height: shape.height,
+                    rgba: shape.rgba.clone(),
+                }
+                .into(),
+            );
+        }
+        out.push(
+            v1::CursorPosition {
+                display,
+                x: cursor.x,
+                y: cursor.y,
+                visible: cursor.visible && cursor.shape.is_some(),
+                shape: cursor.shape.as_ref().map_or(0, |s| s.id),
+            }
+            .into(),
+        );
+        out
+    }
+
     /// Paced capture and encode. Sends a frame when the desktop changed or a
-    /// keyframe was requested. Returns when the viewer is gone.
+    /// keyframe was requested, and (with `send_cursor`) the pointer's shape
+    /// and position when they change. Returns when the viewer is gone.
     fn capture_loop(
         display: &DisplayInfo,
         settings: &Settings,
         frames: &mpsc::Sender<VideoMessage>,
         keyframe: &AtomicBool,
+        send_cursor: bool,
     ) -> Result<(), BoxError> {
         let mut capturer = PlatformCapturer::open(display)?;
+        let mut cursor_serial = 0u64;
+        let mut sent_shapes = std::collections::HashSet::new();
         let interval = Duration::from_secs_f64(1.0 / settings.fps as f64);
         let mut encoder: Option<Vp9Encoder> = None;
         let mut yuv = I420Frame::default();
@@ -415,6 +598,17 @@ mod host {
                 }
                 _ => false,
             };
+            if send_cursor
+                && let Some(cursor) = capturer.cursor()
+                && cursor.serial != cursor_serial
+            {
+                cursor_serial = cursor.serial;
+                for msg in cursor_messages(display.id, cursor, &mut sent_shapes) {
+                    if frames.blocking_send(msg).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
             let want_key = keyframe.load(Ordering::Relaxed);
             if !have_image || !(changed || want_key) {
                 continue;
