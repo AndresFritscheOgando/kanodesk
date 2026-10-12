@@ -2,14 +2,23 @@
 //!
 //! Reads the config (`kanodesk_config`, created with defaults on first run),
 //! loads the device key and passwords from the key store, and runs the host
-//! engine on the direct-access port. The connection manager runs as a
-//! separate process (`kanodesk --cm`), started on demand when a session
-//! appears; it talks to this process over IPC. With `hide_cm` (password-only
-//! hosts) sessions are accepted without a window.
+//! engine:
+//!
+//! - by ID: registered with the configured ID server
+//!   ([`kanodesk_host::presence`]), connections arrive on the device socket;
+//! - directly on the direct-access port, if enabled.
+//!
+//! The connection manager runs as a separate process (`kanodesk --cm`),
+//! started on demand when a session appears; with `hide_cm` (password-only
+//! hosts) sessions are accepted without a window. The main window talks to
+//! this process over the control IPC ([`kanodesk_host::control`]): it shows
+//! the ID and password, asks for a new password, sets the permanent one,
+//! has settings re-read, and stops the host it started.
 //!
 //! ```text
-//! kanodesk --server [--config FILE] [--data-dir DIR] [--listen ADDR]
+//! kanodesk --server [--config FILE] [--data-dir DIR] [--listen ADDR] [--port N]
 //!                   [--approve-mode password|click|both] [--display N] [--no-cm-launch]
+//!                   [--log FILE]
 //! ```
 //!
 //! Command-line values override the config for this run only.
@@ -25,12 +34,16 @@ pub struct ServerArgs {
     pub data_dir: Option<PathBuf>,
     /// Direct-access address (overrides `direct-access-listen`).
     pub listen: Option<String>,
+    /// UDP port of the device socket used for connections by ID (0: any).
+    pub port: u16,
     /// Approve mode (overrides `approve-mode`).
     pub approve_mode: Option<String>,
     /// Display to show.
     pub display: Option<u32>,
     /// Do not start the CM process (it must be started by hand).
     pub no_cm_launch: bool,
+    /// Write the log here instead of the console.
+    pub log: Option<PathBuf>,
 }
 
 /// Parses the arguments after `--server`.
@@ -43,6 +56,7 @@ pub fn parse(args: &[String]) -> Result<ServerArgs, String> {
             "--config" => a.config = Some(value()?.into()),
             "--data-dir" => a.data_dir = Some(value()?.into()),
             "--listen" => a.listen = Some(value()?),
+            "--port" => a.port = value()?.parse().map_err(|e| format!("--port: {e}"))?,
             "--approve-mode" => {
                 let v = value()?;
                 if !kanodesk_config::options::APPROVE_MODES.contains(&v.as_str()) {
@@ -54,26 +68,34 @@ pub fn parse(args: &[String]) -> Result<ServerArgs, String> {
                 a.display = Some(value()?.parse().map_err(|e| format!("--display: {e}"))?)
             }
             "--no-cm-launch" => a.no_cm_launch = true,
+            "--log" => a.log = Some(value()?.into()),
             other => return Err(format!("unknown argument {other}")),
         }
     }
     Ok(a)
 }
 
-/// Runs the host process until Ctrl+C.
+/// The host's data directory: `--data-dir`, else `<data>\host`.
+pub fn data_dir(args: &ServerArgs) -> Option<PathBuf> {
+    args.data_dir.clone().or_else(crate::paths::host_data_dir)
+}
+
+/// Runs the host process until Ctrl+C or a main window stops it.
 #[cfg(windows)]
 pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::sync::Arc;
 
     use kanodesk_config::{Config, HostSettings, secrets};
-    use kanodesk_crypto::DeviceIdentity;
     use kanodesk_crypto::password::{Charset, HostPasswords, TemporaryPolicy};
     use kanodesk_crypto::throttle::{self, ThrottleConfig};
+    use kanodesk_crypto::{DeviceIdentity, KeyStore};
     use kanodesk_host::cm::Launcher;
+    use kanodesk_host::control::ControlServer;
     use kanodesk_host::engine::{EngineParts, EngineSettings, platform_displays, platform_input};
     use kanodesk_host::video::{VideoSettings, capture_producer};
     use kanodesk_host::{
-        AutoAccept, ConnectionManager, HostEngine, IpcConnectionManager, VideoHub,
+        AutoAccept, ConnectionManager, HostEngine, HostRuntime, IpcConnectionManager, RuntimeParts,
+        VideoHub,
     };
     use kanodesk_transport::endpoint;
     use kanodesk_transport::tls::Identity;
@@ -96,13 +118,8 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
     }
     let settings = HostSettings::from_config(&config);
 
-    let data_dir = match args.data_dir.clone() {
-        Some(d) => d,
-        None => secrets::default_data_dir()
-            .ok_or("no data directory")?
-            .join("host"),
-    };
-    let store = secrets::key_store(&data_dir)?;
+    let data_dir = data_dir(&args).ok_or("no data directory")?;
+    let store: Arc<dyn KeyStore> = Arc::from(secrets::key_store(&data_dir)?);
     let (identity, _) = DeviceIdentity::load_or_create(store.as_ref())?;
     let policy = TemporaryPolicy::new(settings.temporary_password_length, Charset::Alphanumeric)?;
     let passwords = HostPasswords::load(policy, store.as_ref())?;
@@ -110,6 +127,13 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
+        // The control endpoint is exclusive: it also tells whether another
+        // host already runs in this Windows session.
+        let (overview_tx, overview_rx) =
+            tokio::sync::watch::channel(kanodesk_ipc::control::HostOverview::default());
+        let mut requests = ControlServer::start(overview_rx)
+            .map_err(|e| format!("another KanoDesk host already runs here ({e})"))?;
+
         let (cm, commands): (Arc<dyn ConnectionManager>, _) = if settings.hide_cm {
             (Arc::new(AutoAccept), None)
         } else {
@@ -144,6 +168,46 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
             });
         }
 
+        let loader_store = store.clone();
+        let host = HostRuntime::start(
+            RuntimeParts {
+                engine: engine.clone(),
+                config_path: config_path.clone(),
+                store,
+                identity: Arc::new(move || {
+                    DeviceIdentity::load_or_create(loader_store.as_ref())
+                        .map(|(id, _)| id)
+                        .map_err(|e| e.to_string())
+                }),
+                data_dir: data_dir.clone(),
+                port: args.port,
+                version: crate::VERSION.to_owned(),
+                interactive_cm: !settings.hide_cm,
+            },
+            &settings,
+        );
+        // Feed the control server from the runtime's overview.
+        {
+            let mut overview = host.overview();
+            tokio::spawn(async move {
+                loop {
+                    let now = overview.borrow_and_update().clone();
+                    overview_tx.send_replace(now);
+                    if overview.changed().await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        {
+            let host = host.clone();
+            tokio::spawn(async move {
+                while let Some(request) = requests.recv().await {
+                    host.handle(request);
+                }
+            });
+        }
+
         let status = engine.status();
         println!("kanodesk {} host", crate::VERSION);
         println!("config {}", config_path.display());
@@ -152,29 +216,42 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         if let Some(pw) = &status.temporary_password {
             println!("temporary password {pw}");
         }
-        if !settings.direct_server {
-            println!("direct access is off (direct-server = N); nothing to accept yet");
-            tokio::signal::ctrl_c().await?;
-            return Ok(());
+        match (&settings.rendezvous_server, &settings.rendezvous_key) {
+            (Some(server), Some(_)) => println!("ID server {server}"),
+            _ => println!("no ID server configured: reachable directly only"),
         }
-        let listen: std::net::SocketAddr = settings
-            .direct_listen
-            .parse()
-            .map_err(|e| format!("direct-access-listen {}: {e}", settings.direct_listen))?;
-        let server = endpoint::server(listen, &Identity::self_signed()?)?;
-        println!("listening on {}", server.local_addr()?);
-        println!(
-            "viewer: spike-viewer --connect <this address> --host-key {} {}",
-            status.device_key,
-            if settings.approve_mode.needs_password() {
-                "(then the password)"
-            } else {
-                "--ask-host"
+
+        let direct = async {
+            if !settings.direct_server {
+                return std::future::pending::<Result<(), String>>().await;
             }
-        );
+            let listen: std::net::SocketAddr = settings
+                .direct_listen
+                .parse()
+                .map_err(|e| format!("direct-access-listen {}: {e}", settings.direct_listen))?;
+            let server =
+                endpoint::server(listen, &Identity::self_signed().map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("direct access on {listen}: {e}"))?;
+            println!(
+                "direct access on {}",
+                server.local_addr().map_err(|e| e.to_string())?
+            );
+            engine.serve(server).await;
+            Ok(())
+        };
         tokio::select! {
-            _ = engine.serve(server) => {}
+            r = direct => {
+                if let Err(e) = r {
+                    // Direct access is optional; keep serving by ID.
+                    tracing::warn!("{e}");
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => println!("stopping"),
+                        _ = host.stopped() => println!("stopped by the main window"),
+                    }
+                }
+            }
             _ = tokio::signal::ctrl_c() => println!("stopping"),
+            _ = host.stopped() => println!("stopped by the main window"),
         }
         Ok(())
     })
@@ -183,13 +260,7 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
 /// Starts `kanodesk --cm` next to this executable, without a console window.
 #[cfg(windows)]
 fn launch_cm() -> std::io::Result<()> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new(std::env::current_exe()?)
-        .arg("--cm")
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map(|_| ())
+    crate::paths::spawn_self(&["--cm"])
 }
 
 /// The host process needs a capture backend; only Windows has one so far.
@@ -219,6 +290,10 @@ mod tests {
             "--no-cm-launch",
             "--data-dir",
             "x",
+            "--port",
+            "21120",
+            "--log",
+            "host.log",
         ]))
         .unwrap();
         assert_eq!(a.approve_mode.as_deref(), Some("click"));
@@ -226,8 +301,12 @@ mod tests {
         assert_eq!(a.display, Some(1));
         assert!(a.no_cm_launch);
         assert_eq!(a.data_dir, Some(PathBuf::from("x")));
+        assert_eq!(data_dir(&a), Some(PathBuf::from("x")));
+        assert_eq!(a.port, 21120);
+        assert_eq!(a.log, Some(PathBuf::from("host.log")));
         assert!(parse(&args(&["--approve-mode", "sometimes"])).is_err());
         assert!(parse(&args(&["--display"])).is_err());
+        assert!(parse(&args(&["--port", "x"])).is_err());
         assert!(parse(&args(&["--bogus"])).is_err());
     }
 }

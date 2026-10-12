@@ -257,6 +257,7 @@ mod tests {
             temporary_password: None,
             approve_mode: "click".into(),
             listen: None,
+            has_permanent_password: false,
         }
     }
 

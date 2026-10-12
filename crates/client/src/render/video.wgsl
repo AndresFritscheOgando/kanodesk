@@ -1,10 +1,11 @@
-// Draws one I420 frame letterboxed into the target, the host's cursor on
-// top of the video when asked, and a text overlay.
+// Draws one I420 frame into a rectangle of the target (letterboxed, or at its
+// original size and scrolled), the host's cursor on top of the video when
+// asked, and a text overlay. Everything outside the rectangle is black.
 // Colour: BT.601 limited range, matching kanodesk_codec::convert.
 
 struct Params {
-    // Size of the video quad relative to the target (1 = fills that axis).
-    scale: vec2<f32>,
+    // The video's rectangle in target UV (0..1, y down): left, top, width, height.
+    video_rect: vec4<f32>,
     // Number of overlay characters.
     text_len: u32,
     // Screen pixels per font pixel.
@@ -89,7 +90,7 @@ fn yuv_to_rgb(y: f32, u: f32, v: f32) -> vec3<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var color = vec3<f32>(0.0);
-    let video_uv = (in.uv - vec2<f32>(0.5)) / params.scale + vec2<f32>(0.5);
+    let video_uv = (in.uv - params.video_rect.xy) / params.video_rect.zw;
     if (all(video_uv >= vec2<f32>(0.0)) && all(video_uv <= vec2<f32>(1.0))) {
         // Explicit LOD: these samples sit in non-uniform control flow.
         let y = textureSampleLevel(y_tex, samp, video_uv, 0.0).r;

@@ -16,18 +16,27 @@
 //! - [`input`]: the input service.
 //! - [`incoming`]: on a forwarded connect request, punch toward the
 //!   controller and bind at the relay.
+//! - [`presence`]: registration with the ID server, reachable by ID.
+//! - [`control`]: the IPC server for the main window.
+//! - [`runtime`]: [`HostRuntime`]: the ID-server link, the overview the main
+//!   window shows, and its requests (passwords, settings reload, stop).
 //!
-//! Status: engine, approval, permissions and services done; the service
-//! (SYSTEM) host process comes with prompt 11.
+//! Status: engine, approval, permissions, services, ID-server registration
+//! and the main window's controls done; the service (SYSTEM) host process
+//! comes with prompt 11.
 
 pub mod cm;
+pub mod control;
 pub mod engine;
 pub mod incoming;
 pub mod input;
+pub mod presence;
+pub mod runtime;
 pub mod video;
 
 pub use cm::{AutoAccept, CmCommand, ConnectionManager, Decision, IpcConnectionManager};
 pub use engine::{EngineParts, EngineSettings, HostEngine};
+pub use runtime::{HostRuntime, RuntimeParts};
 pub use video::{VideoHub, VideoSettings};
 
 /// Spec documents, relative to the workspace root, that describe this crate's behaviour.

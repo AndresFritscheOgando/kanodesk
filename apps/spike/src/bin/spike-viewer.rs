@@ -873,11 +873,7 @@ impl App {
             .iter()
             .find(|d| d.id == display)
             .map_or(self.video_size, |d| (d.width, d.height));
-        let view = ViewMapping {
-            window: (size.width, size.height),
-            video: self.video_size,
-            display: display_size,
-        };
+        let view = ViewMapping::new((size.width, size.height), self.video_size, display_size);
         self.view = Some(view);
         self.input.set_view(display, view);
     }

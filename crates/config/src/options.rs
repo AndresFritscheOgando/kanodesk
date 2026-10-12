@@ -76,6 +76,12 @@ impl OptionDef {
 /// How incoming sessions are approved.
 pub const APPROVE_MODES: &[&str] = &["password", "click", "both"];
 
+/// How the viewer fits the remote picture.
+pub const VIEW_STYLES: &[&str] = &["fit", "original"];
+
+/// Image quality presets a viewer asks for.
+pub const IMAGE_QUALITIES: &[&str] = &["balanced", "best", "low"];
+
 /// Every option.
 pub const OPTIONS: &[OptionDef] = &[
     // Security and access.
@@ -196,6 +202,25 @@ pub const OPTIONS: &[OptionDef] = &[
         description: "Video bitrate in kbit/s (0 = automatic for the display size)",
         lockable: false,
     },
+    // Viewer defaults (this user's viewer windows).
+    OptionDef {
+        key: "view-style",
+        scope: Scope::Local,
+        kind: Kind::Choice(VIEW_STYLES),
+        default: "fit",
+        section: "display",
+        description: "How a new viewer window shows the remote screen: scaled to fit, or at its original size",
+        lockable: false,
+    },
+    OptionDef {
+        key: "image-quality",
+        scope: Scope::Local,
+        kind: Kind::Choice(IMAGE_QUALITIES),
+        default: "balanced",
+        section: "display",
+        description: "Image quality a new viewer window asks for: balanced, best (more bandwidth) or low (slow links)",
+        lockable: false,
+    },
     // UI.
     OptionDef {
         key: "hide_cm",
@@ -246,6 +271,13 @@ mod tests {
         let c = find("approve-mode").unwrap();
         assert_eq!(c.normalise("Click").as_deref(), Some("click"));
         assert_eq!(c.normalise("never"), None);
+        let v = find("view-style").unwrap();
+        assert_eq!((v.scope, v.default), (Scope::Local, "fit"));
+        assert_eq!(v.normalise("Original").as_deref(), Some("original"));
+        assert_eq!(
+            find("image-quality").unwrap().normalise("best").as_deref(),
+            Some("best")
+        );
         assert!(find("no-such-option").is_none());
     }
 }

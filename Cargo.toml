@@ -133,8 +133,12 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 
 # UI (one of these gets picked in phase 1, see PROGRESS.md)
 slint = "1.18"
-# glow backend: the CM window does not pull a second wgpu version in.
+# glow backend for the main window and the CM; the viewer drives egui itself
+# on the same wgpu (30) and winit (0.30) as its video renderer.
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+egui = "0.36"
+egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links"] }
+egui-wgpu = { version = "0.36", default-features = false }
 
 # Logging, errors, CLI
 tracing = "0.1"

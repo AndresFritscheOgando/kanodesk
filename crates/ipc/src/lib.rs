@@ -13,13 +13,15 @@
 //!   other users on a Unix socket); the first pipe instance is created
 //!   exclusively so nobody can squat the name once the server runs.
 //! - [`cm`]: the messages between the host and the connection manager.
+//! - [`control`]: the messages between the host and the main window.
 //!
 //! Specified by:
 //! - `docs/02-architecture.md`
 //!
-//! Status: transport and connection-manager messages.
+//! Status: transport, connection-manager and main-window messages.
 
 pub mod cm;
+pub mod control;
 
 use std::io;
 

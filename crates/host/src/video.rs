@@ -9,15 +9,20 @@
 //! decoding. A subscriber that falls behind skips ahead and asks for a
 //! keyframe. Producers run on their own threads (capture and encode block).
 //!
+//! Image quality ([`ImageQuality`], 06 §5) is a property of the feed: any
+//! subscriber can change it ([`VideoSubscription::set_quality`]) and the
+//! producer adjusts its bitrate ([`quality_bitrate`]). Since the feed is
+//! shared, every viewer of that display gets the latest choice.
+//!
 //! The producer is a function ([`ProducerFn`]); on Windows,
 //! [`capture_producer`] captures with DXGI and encodes VP9. Tests use
 //! synthetic producers.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use kanodesk_proto::v1::{VideoMessage, video_message::Msg};
+use kanodesk_proto::v1::{ImageQuality, VideoMessage, video_message::Msg};
 use tokio::sync::broadcast;
 
 /// How many messages a subscriber may fall behind before it skips ahead.
@@ -38,7 +43,19 @@ struct Replay {
 struct Feed {
     tx: broadcast::Sender<Arc<VideoMessage>>,
     keyframe: AtomicBool,
+    /// An `ImageQuality` value.
+    quality: AtomicI32,
     replay: Mutex<Replay>,
+}
+
+/// The bitrate for a quality preset, from the configured (balanced) one:
+/// twice as much for `Best`, half for `Low` (at least 200 kbit/s).
+pub fn quality_bitrate(balanced_kbps: u32, quality: ImageQuality) -> u32 {
+    match quality {
+        ImageQuality::Best => balanced_kbps.saturating_mul(2).min(100_000),
+        ImageQuality::Low => (balanced_kbps / 2).max(200),
+        ImageQuality::Balanced | ImageQuality::Unspecified => balanced_kbps,
+    }
 }
 
 /// The producer's side of a display feed.
@@ -79,6 +96,14 @@ impl Producer {
     pub fn wanted(&self) -> bool {
         self.feed.tx.receiver_count() > 0
     }
+
+    /// The quality preset viewers asked for (balanced by default).
+    pub fn quality(&self) -> ImageQuality {
+        match ImageQuality::try_from(self.feed.quality.load(Ordering::Relaxed)) {
+            Ok(ImageQuality::Unspecified) | Err(_) => ImageQuality::Balanced,
+            Ok(q) => q,
+        }
+    }
 }
 
 /// One session's view of a display feed.
@@ -112,6 +137,11 @@ impl VideoSubscription {
     /// Asks the producer for a keyframe soon.
     pub fn request_keyframe(&self) {
         self.feed.keyframe.store(true, Ordering::Relaxed);
+    }
+
+    /// Sets the display's quality preset (for every viewer of it).
+    pub fn set_quality(&self, quality: ImageQuality) {
+        self.feed.quality.store(quality as i32, Ordering::Relaxed);
     }
 }
 
@@ -147,6 +177,7 @@ impl VideoHub {
                 let feed = Arc::new(Feed {
                     tx,
                     keyframe: AtomicBool::new(true),
+                    quality: AtomicI32::new(ImageQuality::Balanced as i32),
                     replay: Mutex::new(Replay::default()),
                 });
                 feeds.insert(display, feed.clone());
@@ -269,7 +300,7 @@ mod capture {
     use kanodesk_codec::{Encoder, EncoderConfig, I420Frame, Vp9Encoder, convert};
     use kanodesk_proto::v1::{self, Codec, VideoMessage};
 
-    use super::{Producer, VideoSettings};
+    use super::{Producer, VideoSettings, quality_bitrate};
 
     fn cursor_messages(
         display: u32,
@@ -320,6 +351,7 @@ mod capture {
         let mut seq = 0u64;
         let mut cursor_serial = 0u64;
         let mut sent_shapes = HashSet::new();
+        let mut quality = out.quality();
         let mut next_tick = Instant::now();
         loop {
             let now = Instant::now();
@@ -372,6 +404,18 @@ mod capture {
                 continue;
             }
             let size = (yuv.width(), yuv.height());
+            let balanced = |size: (u32, u32)| {
+                settings
+                    .bitrate_kbps
+                    .unwrap_or_else(|| EncoderConfig::new(size.0, size.1).bitrate_kbps)
+            };
+            if let Some(e) = encoder.as_mut()
+                && out.quality() != quality
+            {
+                quality = out.quality();
+                e.set_bitrate(quality_bitrate(balanced(size), quality))
+                    .map_err(|e| e.to_string())?;
+            }
             if encoder
                 .as_ref()
                 .map(|e| (e.config().width, e.config().height))
@@ -380,9 +424,8 @@ mod capture {
                 let mut config = EncoderConfig::new(size.0, size.1);
                 config.fps = settings.fps;
                 config.speed = settings.speed;
-                if let Some(kbps) = settings.bitrate_kbps {
-                    config.bitrate_kbps = kbps;
-                }
+                quality = out.quality();
+                config.bitrate_kbps = quality_bitrate(balanced(size), quality);
                 encoder = Some(Vp9Encoder::new(config).map_err(|e| e.to_string())?);
                 let start = v1::StreamStart {
                     display,
@@ -564,6 +607,57 @@ mod tests {
             }
         }
         assert!(got_key);
+    }
+
+    #[tokio::test]
+    async fn quality_is_shared_by_the_feed() {
+        let hub = VideoHub::new(Arc::new(|_, out: &Producer| {
+            // Report the quality as the frame's display field.
+            while out.send(
+                v1::VideoFrame {
+                    display: out.quality() as u32,
+                    ..Default::default()
+                }
+                .into(),
+            ) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        }));
+        let mut a = hub.subscribe(0);
+        let b = hub.subscribe(0);
+        assert_eq!(
+            first_frame(&mut a).await.display,
+            ImageQuality::Balanced as u32
+        );
+        b.set_quality(ImageQuality::Best);
+        let mut seen = false;
+        for _ in 0..50 {
+            if first_frame(&mut a).await.display == ImageQuality::Best as u32 {
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "a's frames follow b's choice");
+        b.set_quality(ImageQuality::Unspecified);
+        let mut back = false;
+        for _ in 0..50 {
+            if first_frame(&mut a).await.display == ImageQuality::Balanced as u32 {
+                back = true;
+                break;
+            }
+        }
+        assert!(back, "unspecified means balanced");
+    }
+
+    #[test]
+    fn quality_bitrates() {
+        assert_eq!(quality_bitrate(3000, ImageQuality::Balanced), 3000);
+        assert_eq!(quality_bitrate(3000, ImageQuality::Unspecified), 3000);
+        assert_eq!(quality_bitrate(3000, ImageQuality::Best), 6000);
+        assert_eq!(quality_bitrate(3000, ImageQuality::Low), 1500);
+        assert_eq!(quality_bitrate(300, ImageQuality::Low), 200);
+        assert_eq!(quality_bitrate(90_000, ImageQuality::Best), 100_000);
     }
 
     #[tokio::test]

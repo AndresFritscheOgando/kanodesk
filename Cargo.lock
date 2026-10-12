@@ -1318,6 +1318,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-wgpu"
+version = "0.36.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cef1f6d1bba40b09a4d0d62cb822b81030922cfbf65c5373398c3a3caafc5bd"
+dependencies = [
+ "ahash",
+ "bytemuck",
+ "document-features",
+ "epaint",
+ "log",
+ "profiling",
+ "thiserror 2.0.21",
+ "type-map",
+ "web-time",
+ "wgpu",
+]
+
+[[package]]
 name = "egui-winit"
 version = "0.36.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1335,6 +1353,7 @@ dependencies = [
  "raw-window-handle",
  "smithay-clipboard",
  "web-time",
+ "webbrowser",
  "winit",
 ]
 
@@ -2458,17 +2477,25 @@ name = "kanodesk-client"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "kanodesk-codec",
+ "kanodesk-config",
  "kanodesk-crypto",
  "kanodesk-host",
  "kanodesk-idserver",
  "kanodesk-input",
+ "kanodesk-ipc",
  "kanodesk-proto",
  "kanodesk-relay",
  "kanodesk-rendezvous",
  "kanodesk-transport",
+ "naga",
+ "pollster",
+ "serde",
  "thiserror 2.0.21",
  "tokio",
+ "toml",
  "tracing",
+ "wgpu",
  "winit",
 ]
 
@@ -2514,15 +2541,24 @@ name = "kanodesk-desktop"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "kanodesk-client",
  "kanodesk-config",
  "kanodesk-crypto",
  "kanodesk-host",
  "kanodesk-input",
  "kanodesk-ipc",
+ "kanodesk-proto",
+ "kanodesk-rendezvous",
  "kanodesk-transport",
+ "pollster",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]
@@ -2617,6 +2653,7 @@ dependencies = [
  "prost",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2636,7 +2673,6 @@ dependencies = [
  "kanodesk-input",
  "kanodesk-proto",
  "kanodesk-transport",
- "naga",
  "pollster",
  "prost",
  "rpassword",
@@ -5158,6 +5194,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
+name = "type-map"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb30dbbd9036155e74adad6812e9898d03ec374946234fbcebd5dfc7b9187b90"
+dependencies = [
+ "rustc-hash 2.1.3",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5552,6 +5597,22 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webbrowser"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62c35be770821a214dbc362fc26908c853e776c0004294d0b10b8a6bad582f94"
+dependencies = [
+ "jni",
+ "log",
+ "ndk-context",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "url",
+ "web-sys",
 ]
 
 [[package]]

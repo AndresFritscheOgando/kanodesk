@@ -1,6 +1,6 @@
 [package]
 name = "kanodesk-desktop"
-description = "KanoDesk desktop app (host process, connection manager; main window and viewer later)"
+description = "KanoDesk desktop app: main window, viewer, host process and connection manager"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,15 +14,24 @@ test = false
 
 [dependencies]
 eframe.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+kanodesk-client.workspace = true
 kanodesk-config.workspace = true
 kanodesk-crypto.workspace = true
 kanodesk-host.workspace = true
 kanodesk-input.workspace = true
 kanodesk-ipc.workspace = true
+kanodesk-proto.workspace = true
+kanodesk-rendezvous.workspace = true
 kanodesk-transport.workspace = true
+pollster.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+wgpu.workspace = true
+winit.workspace = true
 
 [lints]
 workspace = true

@@ -159,6 +159,16 @@ impl HostPasswords {
         Ok(&self.temporary)
     }
 
+    /// Switches to a new policy (e.g. another length). If it differs, the
+    /// temporary password is replaced by one that follows it.
+    pub fn set_policy(&mut self, policy: TemporaryPolicy) -> Result<(), CryptoError> {
+        if policy != self.policy {
+            self.policy = policy;
+            self.rotate_temporary()?;
+        }
+        Ok(())
+    }
+
     /// Counts temporary passwords: changes on every rotation. A login
     /// records it when it starts, so it can tell at the end whether the
     /// password it checked is still the current one.
@@ -277,6 +287,20 @@ mod tests {
         let after = pw.rotate_temporary().unwrap().to_owned();
         assert_ne!(before, after);
         assert_eq!(pw.generation(), 1);
+    }
+
+    #[test]
+    fn a_new_policy_replaces_the_temporary_password() {
+        let mut pw = HostPasswords::new(TemporaryPolicy::default()).unwrap();
+        let before = pw.temporary().to_owned();
+        pw.set_policy(TemporaryPolicy::default()).unwrap();
+        assert_eq!(pw.temporary(), before, "same policy: kept");
+        let ten = TemporaryPolicy::new(10, Charset::Digits).unwrap();
+        pw.set_policy(ten).unwrap();
+        assert_eq!(pw.temporary().len(), 10);
+        assert!(pw.temporary().bytes().all(|b| b.is_ascii_digit()));
+        assert_eq!(pw.generation(), 1);
+        assert_eq!(pw.policy(), &ten);
     }
 
     #[test]

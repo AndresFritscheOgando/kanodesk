@@ -1,8 +1,9 @@
 //! Viewer-side input: window events in, [`InputEvent`]s out (07).
 //!
 //! - [`ViewMapping`] maps a window position to a pixel on the remote
-//!   display, through the same letterboxing the renderer uses and the scale
-//!   between the video and the display.
+//!   display, through the same layout the renderer draws (letterboxed, or at
+//!   the original size and scrolled; inside an area of the window, e.g.
+//!   below a toolbar) and the scale between the video and the display.
 //! - [`hid_usage`] turns a winit physical key into its USB HID usage (Map
 //!   mode: the key's position, not its character), media keys included.
 //! - [`ViewerInput`] tracks what is held and what the host allows, and turns
@@ -49,49 +50,155 @@ impl Default for SendOptions {
     }
 }
 
+/// How the video fills its area (15 §2, "view styles").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewStyle {
+    /// Scaled to fit the area, keeping its aspect ratio (bars around it).
+    #[default]
+    Fit,
+    /// One video pixel per window pixel; centred when smaller than the area,
+    /// scrolled when larger.
+    Original,
+}
+
 /// Maps window positions to remote display pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewMapping {
-    /// Window client area, physical pixels.
+    /// The area the video is shown in, physical pixels (the whole client
+    /// area, or what a toolbar leaves of it).
     pub window: (u32, u32),
     /// Decoded video size.
     pub video: (u32, u32),
     /// The remote display's size in its own pixels (equal to `video` unless
     /// the host scales the stream).
     pub display: (u32, u32),
+    /// Top-left corner of the area in the window.
+    pub origin: (f64, f64),
+    /// Fit or original size.
+    pub style: ViewStyle,
+    /// With [`ViewStyle::Original`]: how far the video is scrolled (clamped
+    /// to what can be scrolled).
+    pub scroll: (f64, f64),
 }
 
 impl ViewMapping {
-    /// The video's rectangle in the window: (left, top, width, height),
-    /// centred and letterboxed like the renderer draws it.
+    /// The video fitted into a `window` of this size at the window's corner.
+    pub fn new(window: (u32, u32), video: (u32, u32), display: (u32, u32)) -> Self {
+        ViewMapping {
+            window,
+            video,
+            display,
+            origin: (0.0, 0.0),
+            style: ViewStyle::Fit,
+            scroll: (0.0, 0.0),
+        }
+    }
+
+    /// The area's rectangle in the window: (left, top, width, height).
+    pub fn area(&self) -> (f64, f64, f64, f64) {
+        (
+            self.origin.0,
+            self.origin.1,
+            self.window.0 as f64,
+            self.window.1 as f64,
+        )
+    }
+
+    /// How far the video can scroll on each axis (0 where it fits).
+    pub fn max_scroll(&self) -> (f64, f64) {
+        match self.style {
+            ViewStyle::Fit => (0.0, 0.0),
+            ViewStyle::Original => (
+                (self.video.0 as f64 - self.window.0 as f64).max(0.0),
+                (self.video.1 as f64 - self.window.1 as f64).max(0.0),
+            ),
+        }
+    }
+
+    /// The scroll position that puts the part of the video under `pos`
+    /// proportionally under the pointer: at the area's left edge the video's
+    /// left edge shows, at its right edge the right edge ("auto scroll").
+    pub fn scroll_toward(&self, pos: (f64, f64)) -> (f64, f64) {
+        let (max_x, max_y) = self.max_scroll();
+        let (left, top, w, h) = self.area();
+        let frac = |p: f64, start: f64, len: f64| {
+            if len <= 0.0 {
+                0.0
+            } else {
+                ((p - start) / len).clamp(0.0, 1.0)
+            }
+        };
+        (
+            (frac(pos.0, left, w) * max_x).round(),
+            (frac(pos.1, top, h) * max_y).round(),
+        )
+    }
+
+    /// The video's rectangle in the window: (left, top, width, height), as
+    /// the renderer draws it. With [`ViewStyle::Original`] it may extend
+    /// past the area.
     pub fn video_rect(&self) -> Option<(f64, f64, f64, f64)> {
         let (ww, wh) = (self.window.0 as f64, self.window.1 as f64);
         let (vw, vh) = (self.video.0 as f64, self.video.1 as f64);
         if ww <= 0.0 || wh <= 0.0 || vw <= 0.0 || vh <= 0.0 {
             return None;
         }
-        let scale = (ww / vw).min(wh / vh);
-        let (w, h) = (vw * scale, vh * scale);
-        Some(((ww - w) / 2.0, (wh - h) / 2.0, w, h))
+        let (ox, oy) = self.origin;
+        match self.style {
+            ViewStyle::Fit => {
+                let scale = (ww / vw).min(wh / vh);
+                let (w, h) = (vw * scale, vh * scale);
+                Some((ox + (ww - w) / 2.0, oy + (wh - h) / 2.0, w, h))
+            }
+            ViewStyle::Original => {
+                let (max_x, max_y) = self.max_scroll();
+                let place = |area: f64, video: f64, max: f64, scroll: f64| {
+                    if video <= area {
+                        (area - video) / 2.0
+                    } else {
+                        -scroll.clamp(0.0, max)
+                    }
+                };
+                Some((
+                    ox + place(ww, vw, max_x, self.scroll.0),
+                    oy + place(wh, vh, max_y, self.scroll.1),
+                    vw,
+                    vh,
+                ))
+            }
+        }
+    }
+
+    /// The part of the video that is visible: its rectangle cut to the area.
+    fn visible_rect(&self) -> Option<(f64, f64, f64, f64)> {
+        let (vl, vt, vw, vh) = self.video_rect()?;
+        let (al, at, aw, ah) = self.area();
+        let (l, t) = (vl.max(al), vt.max(at));
+        let (r, b) = ((vl + vw).min(al + aw), (vt + vh).min(at + ah));
+        (r > l && b > t).then_some((l, t, r - l, b - t))
     }
 
     /// The display pixel under window position `pos`, or `None` outside the
-    /// video (on the letterbox bars or off the window).
+    /// visible video (on the bars, outside the area or off the window).
     pub fn to_display(&self, pos: (f64, f64)) -> Option<(i32, i32)> {
-        let (left, top, w, h) = self.video_rect()?;
-        let (u, v) = ((pos.0 - left) / w, (pos.1 - top) / h);
-        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+        let (l, t, w, h) = self.visible_rect()?;
+        if !(l..l + w).contains(&pos.0) || !(t..t + h).contains(&pos.1) {
             return None;
         }
-        Some(self.pixel(u, v))
+        let (left, top, w, h) = self.video_rect()?;
+        Some(self.pixel((pos.0 - left) / w, (pos.1 - top) / h))
     }
 
-    /// Like [`Self::to_display`], but positions outside the video are moved
-    /// to its nearest edge (for drags that leave the picture).
+    /// Like [`Self::to_display`], but positions outside the visible video
+    /// are moved to its nearest edge (for drags that leave the picture).
     pub fn to_display_clamped(&self, pos: (f64, f64)) -> Option<(i32, i32)> {
+        let (l, t, w, h) = self.visible_rect()?;
+        // Just inside the far edges: the last visible pixel, not the next.
+        let x = pos.0.clamp(l, l + w - 1e-6);
+        let y = pos.1.clamp(t, t + h - 1e-6);
         let (left, top, w, h) = self.video_rect()?;
-        let u = ((pos.0 - left) / w).clamp(0.0, 1.0);
-        let v = ((pos.1 - top) / h).clamp(0.0, 1.0);
+        let u = ((x - left) / w).clamp(0.0, 1.0);
+        let v = ((y - top) / h).clamp(0.0, 1.0);
         Some(self.pixel(u, v))
     }
 
@@ -815,11 +922,7 @@ mod tests {
     use winit::event::MouseButton as W;
 
     fn mapping(window: (u32, u32), video: (u32, u32)) -> ViewMapping {
-        ViewMapping {
-            window,
-            video,
-            display: video,
-        }
+        ViewMapping::new(window, video, video)
     }
 
     #[test]
@@ -853,14 +956,62 @@ mod tests {
 
     #[test]
     fn video_scaled_down_by_the_host_maps_to_full_display_pixels() {
-        let m = ViewMapping {
-            window: (1280, 720),
-            video: (1280, 720),
-            display: (2560, 1440),
-        };
+        let m = ViewMapping::new((1280, 720), (1280, 720), (2560, 1440));
         assert_eq!(m.to_display((640.0, 360.0)), Some((1280, 720)));
         assert_eq!(m.to_display((1279.9, 719.9)), Some((2559, 1439)));
         assert_eq!(mapping((0, 0), (10, 10)).to_display((0.0, 0.0)), None);
+    }
+
+    #[test]
+    fn an_area_below_a_toolbar_shifts_the_video() {
+        // 1000x540 area starting 40 px down; 16:9 video fills it exactly
+        // with bars left and right.
+        let mut m = mapping((1000, 540), (1920, 1080));
+        m.origin = (0.0, 40.0);
+        let (left, top, w, h) = m.video_rect().unwrap();
+        assert_eq!((left, top, w, h), (20.0, 40.0, 960.0, 540.0));
+        assert_eq!(m.to_display((20.0, 39.0)), None, "on the toolbar");
+        assert_eq!(m.to_display((20.0, 40.0)), Some((0, 0)));
+        assert_eq!(m.to_display((500.0, 310.0)), Some((960, 540)));
+        // A drag up onto the toolbar stays on the video's top edge.
+        assert_eq!(m.to_display_clamped((500.0, 0.0)), Some((960, 0)));
+    }
+
+    #[test]
+    fn original_size_centres_small_video_and_scrolls_large_video() {
+        // Small video: centred, 1:1, no scrolling.
+        let mut m = mapping((1000, 800), (800, 600));
+        m.style = ViewStyle::Original;
+        assert_eq!(m.max_scroll(), (0.0, 0.0));
+        assert_eq!(m.video_rect(), Some((100.0, 100.0, 800.0, 600.0)));
+        assert_eq!(m.to_display((100.0, 100.0)), Some((0, 0)));
+        assert_eq!(m.to_display((99.0, 100.0)), None);
+        assert_eq!(m.to_display((899.5, 699.5)), Some((799, 599)));
+
+        // Large video in a smaller area below a toolbar.
+        let mut m = mapping((1000, 500), (1920, 1080));
+        m.style = ViewStyle::Original;
+        m.origin = (0.0, 30.0);
+        assert_eq!(m.max_scroll(), (920.0, 580.0));
+        assert_eq!(m.video_rect(), Some((0.0, 30.0, 1920.0, 1080.0)));
+        assert_eq!(m.to_display((10.0, 40.0)), Some((10, 10)));
+        assert_eq!(m.to_display((1500.0, 40.0)), None, "past the area");
+        m.scroll = (920.0, 580.0);
+        assert_eq!(m.to_display((999.5, 529.5)), Some((1919, 1079)));
+        // Scrolling is clamped.
+        m.scroll = (5000.0, -10.0);
+        assert_eq!(m.video_rect(), Some((-920.0, 30.0, 1920.0, 1080.0)));
+        // Auto scroll follows the pointer across the area.
+        assert_eq!(m.scroll_toward((0.0, 30.0)), (0.0, 0.0));
+        assert_eq!(m.scroll_toward((500.0, 280.0)), (460.0, 290.0));
+        assert_eq!(m.scroll_toward((2000.0, 900.0)), (920.0, 580.0));
+        // Drags clamp to the visible part, not the whole video.
+        m.scroll = (0.0, 0.0);
+        assert_eq!(m.to_display_clamped((3000.0, 3000.0)), Some((999, 499)));
+        // Fit never scrolls.
+        let fit = mapping((1000, 500), (1920, 1080));
+        assert_eq!(fit.max_scroll(), (0.0, 0.0));
+        assert_eq!(fit.scroll_toward((900.0, 400.0)), (0.0, 0.0));
     }
 
     #[test]

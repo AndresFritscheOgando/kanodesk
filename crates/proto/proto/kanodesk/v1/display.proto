@@ -31,3 +31,20 @@ message SetResolution {
   uint32 width = 2;
   uint32 height = 3;
 }
+
+// Image quality presets (06 §5). The host picks the bitrate for each; a
+// display's video is shared by every viewer of it, so the latest request wins.
+enum ImageQuality {
+  IMAGE_QUALITY_UNSPECIFIED = 0;
+  // The host's configured bitrate.
+  IMAGE_QUALITY_BALANCED = 1;
+  // About twice the bitrate: sharper text, more bandwidth.
+  IMAGE_QUALITY_BEST = 2;
+  // About half the bitrate: for slow links.
+  IMAGE_QUALITY_LOW = 3;
+}
+
+// Viewer to host: use this quality preset for the display being shown.
+message SetImageQuality {
+  ImageQuality quality = 1;
+}

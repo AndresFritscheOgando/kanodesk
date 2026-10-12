@@ -99,14 +99,7 @@ async fn viewer_input_reaches_the_host_display() {
     // Half-size window showing host display 1.
     let mut viewer = ViewerInput::new();
     viewer.set_permissions(Permissions::ALL);
-    viewer.set_view(
-        1,
-        ViewMapping {
-            window: (960, 540),
-            video: (1920, 1080),
-            display: (1920, 1080),
-        },
-    );
+    viewer.set_view(1, ViewMapping::new((960, 540), (1920, 1080), (1920, 1080)));
     // A burst of pointer moves, faster than one per frame.
     for i in 0..100 {
         if let Some(e) = viewer.cursor_moved((100.0 + i as f64, 50.0)) {

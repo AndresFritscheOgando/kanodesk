@@ -46,6 +46,8 @@ enum Capability {
   // Accepts `TextInput` (Translate mode) and relative mouse moves.
   CAPABILITY_INPUT_TEXT = 11;
   CAPABILITY_INPUT_RELATIVE_MOUSE = 12;
+  // Accepts `SetImageQuality`.
+  CAPABILITY_IMAGE_QUALITY = 13;
 }
 
 message Hello {
@@ -192,5 +194,6 @@ message ControlMessage {
     Sealed sealed = 15;
     AuthConfirm auth_confirm = 16;
     LoginPending login_pending = 17;
+    SetImageQuality set_image_quality = 18;
   }
 }

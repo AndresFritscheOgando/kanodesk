@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub const CM_ROLE: &str = "cm";
 
 /// Version of these messages; both sides must agree.
-pub const CM_PROTOCOL: u32 = 1;
+pub const CM_PROTOCOL: u32 = 2;
 
 /// What a session may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,7 +71,7 @@ pub struct SessionInfo {
 }
 
 /// The host as the CM shows it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostStatus {
     /// This host's device key (hex).
     pub device_key: String,
@@ -81,6 +81,8 @@ pub struct HostStatus {
     pub approve_mode: String,
     /// Where direct connections arrive, if enabled.
     pub listen: Option<String>,
+    /// Whether a permanent password is set.
+    pub has_permanent_password: bool,
 }
 
 /// Host to CM.
@@ -174,6 +176,7 @@ mod tests {
                     temporary_password: Some("k7mq4z2p".into()),
                     approve_mode: "both".into(),
                     listen: None,
+                    has_permanent_password: true,
                 },
                 sessions: vec![session()],
             },

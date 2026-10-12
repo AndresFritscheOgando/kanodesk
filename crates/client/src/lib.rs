@@ -12,14 +12,28 @@
 //! - [`connect`]: how a controller reaches a host: LAN, then a direct punch
 //!   (IPv4 and IPv6), then the relay, logging which path won.
 //! - [`cursor`]: the host's pointer (shapes, position, local or drawn).
-//! - [`input`]: viewer-side input: window → display mapping, key codes,
-//!   held-key tracking, move coalescing and the input stream (07).
+//! - [`input`]: viewer-side input: window → display mapping (fit or
+//!   original size, scrolling), key codes, held-key tracking, move
+//!   coalescing and the input stream (07).
+//! - [`session`]: [`session::Session`], the whole viewer session: ID
+//!   server, path race, login with password prompts, video streams and
+//!   display switches, quality, input; with user-facing reasons for every
+//!   way it can fail.
+//! - [`video`]: decoder thread and the one-frame mailbox.
+//! - [`render`]: the wgpu YUV pipeline (any target; the desktop viewer draws
+//!   its toolbar over it).
+//! - [`peers`]: the recent-sessions list.
 //!
-//! Status: connection strategy and input done; session and decode come next.
+//! Status: everything a viewer window needs; the window itself is in
+//! `apps/desktop`.
 
 pub mod connect;
 pub mod cursor;
 pub mod input;
+pub mod peers;
+pub mod render;
+pub mod session;
+pub mod video;
 
 pub use connect::{ConnectOptions, ConnectPlan, Established, PathKind, connect};
 

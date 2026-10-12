@@ -9,6 +9,7 @@
 //! - [`record`]: what the server signs and how clients check it. Shared with
 //!   the server (`kanodesk-idserver`).
 //! - [`RendezvousClient`]: one long-lived QUIC connection to the ID server.
+//! - [`link`]: resolve, connect and detect the NAT type in one step.
 //!
 //! Trust model: the client config pins the server's ed25519 key. The server
 //! proves it holds that key by signing the TLS channel binding of the
@@ -26,6 +27,7 @@
 
 pub mod client;
 pub mod id;
+pub mod link;
 pub mod record;
 
 pub use client::{
@@ -79,6 +81,9 @@ pub enum ClientError {
     /// The connection to the server is gone.
     #[error("connection to the ID server closed")]
     Closed,
+    /// The server's name did not resolve.
+    #[error("cannot resolve the ID server {0}")]
+    Resolve(String),
     /// Key generation or signing failed.
     #[error("crypto: {0}")]
     Crypto(#[from] kanodesk_crypto::CryptoError),

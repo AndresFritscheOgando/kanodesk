@@ -33,8 +33,5 @@ tokio.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 
-[dev-dependencies]
-naga = { version = "30.0", features = ["wgsl-in"] }
-
 [lints]
 workspace = true

@@ -72,6 +72,7 @@ envelope_from!(ControlMessage, control_message,
     Sealed => Sealed,
     AuthConfirm => AuthConfirm,
     LoginPending => LoginPending,
+    SetImageQuality => SetImageQuality,
 );
 
 envelope_from!(VideoMessage, video_message,
@@ -120,5 +121,8 @@ mod tests {
         assert_eq!(v1::Capability::KeyframeRequest as i32, 4);
         assert_eq!(v1::CloseReason::IncompatibleVersion as i32, 2);
         assert_eq!(v1::MouseButton::Forward as i32, 16);
+        assert_eq!(v1::Capability::MultiDisplay as i32, 8);
+        assert_eq!(v1::Capability::ImageQuality as i32, 13);
+        assert_eq!(v1::ImageQuality::Low as i32, 3);
     }
 }

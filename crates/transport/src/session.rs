@@ -78,12 +78,20 @@ pub struct SecureControl<R, W> {
     reader: MessageReader<R, ControlMessage>,
     writer: MessageWriter<W, ControlMessage>,
     channel: SecureChannel,
+    /// Client side, after a successful login: what the host said about itself.
+    peer_info: Option<v1::PeerInfo>,
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> SecureControl<R, W> {
     /// The peer's authenticated device key.
     pub fn remote(&self) -> &DevicePublicKey {
         self.channel.remote()
+    }
+
+    /// Client side, after a successful login: the host's self-description
+    /// (host name, user, platform, agent) from its `LoginResult`.
+    pub fn peer_info(&self) -> Option<&v1::PeerInfo> {
+        self.peer_info.as_ref()
     }
 
     /// Seals and sends one message.
@@ -212,6 +220,7 @@ pub async fn client_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         reader,
         writer,
         channel,
+        peer_info: None,
     };
 
     let negotiated = exchange_hello(&mut control, ours, true).await?;
@@ -272,17 +281,18 @@ pub async fn client_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// Checks the final `LoginResult`: success needs the host's key
 /// confirmation when a password was used.
 fn finish_login<R, W>(
-    control: SecureControl<R, W>,
+    mut control: SecureControl<R, W>,
     negotiated: Negotiated,
     result: &v1::LoginResult,
     confirmed: Option<kanodesk_crypto::login::ClientConfirmed>,
 ) -> ClientLoginResult<R, W> {
     match result.result {
-        Some(login_result::Result::PeerInfo(_)) => {
+        Some(login_result::Result::PeerInfo(ref info)) => {
             let kind = match confirmed {
                 Some(c) => Some(c.verify_host(&result.confirmation)?),
                 None => None,
             };
+            control.peer_info = Some(info.clone());
             Ok((control, negotiated, kind))
         }
         _ => Err(rejection(result)),
@@ -465,6 +475,7 @@ pub async fn host_authenticate<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         reader,
         writer,
         channel,
+        peer_info: None,
     };
 
     let negotiated = exchange_hello(&mut control, ours, false).await?;
@@ -833,8 +844,13 @@ mod tests {
     async fn click_approval_lets_a_viewer_in_without_a_password() {
         let host = Host::new(ThrottleConfig::default());
         let (client, waits, seen) = run_approval(&host, Credentials::AskHost, false, true).await;
-        let (_, _, kind) = client.unwrap();
+        let (control, _, kind) = client.unwrap();
         assert_eq!(kind, None, "no password used");
+        assert_eq!(
+            control.peer_info().map(|p| p.agent.as_str()),
+            Some("test"),
+            "the viewer learned who the host is"
+        );
         assert_eq!(waits, 1, "told to wait once");
         let seen = seen.unwrap();
         assert_eq!(

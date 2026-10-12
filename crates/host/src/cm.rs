@@ -246,12 +246,7 @@ async fn serve_cm(
         sessions.sort_by_key(|s| s.id);
         HostToCm::Hello {
             protocol: CM_PROTOCOL,
-            status: s.status.clone().unwrap_or(HostStatus {
-                device_key: String::new(),
-                temporary_password: None,
-                approve_mode: String::new(),
-                listen: None,
-            }),
+            status: s.status.clone().unwrap_or_default(),
             sessions,
         }
     };
@@ -380,6 +375,7 @@ mod tests {
             temporary_password: Some("pw".into()),
             approve_mode: "click".into(),
             listen: None,
+            has_permanent_password: false,
         });
         // A session needing approval while no CM is connected: the CM is launched.
         let approval = cm.request_approval(&info(7, awaiting()));

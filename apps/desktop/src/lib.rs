@@ -1,30 +1,46 @@
 //! # kanodesk-desktop
 //!
-//! The `kanodesk` app. One binary, several roles (02 §1.1):
+//! The `kanodesk` app. One binary, several roles (02 §1.1), each its own
+//! process:
 //!
+//! - `kanodesk`: the main window ([`main_window`], state in
+//!   [`main_model`]): this device's ID and one-time password, a connect
+//!   box, recent sessions and settings. It starts the host process if none
+//!   runs.
+//! - `kanodesk --connect ID`: a viewer window ([`viewer`], state in
+//!   [`viewer_model`]): the remote screen with a toolbar (display, fit or
+//!   original size, quality, Ctrl+Alt+Del, disconnect) and the status and
+//!   error dialogs.
 //! - `kanodesk --server`: the host process ([`server`]): config, device key,
-//!   the host engine on the direct-access port, and the IPC endpoint for the
-//!   connection manager.
+//!   the host engine reachable by ID and on the direct-access port, and the
+//!   IPC endpoints for the main window and the connection manager.
 //! - `kanodesk --cm`: the connection-manager window ([`cm`], state in
 //!   [`cm_model`]): who is connecting, Accept/Deny, live permissions,
 //!   Disconnect.
 //! - `kanodesk --cm-cmd …`: the same from the command line ([`cm_cli`]).
 //!
-//! The main window and the remote viewer come with prompt 10 (until then
-//! the viewer is `spike-viewer`). The CM window uses egui (eframe, glow
-//! backend); the toolkit for the main window is decided there.
+//! The windows are thin: sessions live in `kanodesk_client::session`, the
+//! host in `kanodesk_host`. The main window and the CM use egui through
+//! eframe (glow); the viewer drives egui itself on top of the wgpu video
+//! renderer, so it keeps raw winit input (left/right modifiers, media keys,
+//! the keyboard grab) that eframe does not expose.
 //!
 //! Specified by:
 //! - `docs/15-ui-and-ffi.md`
 //! - `docs/02-architecture.md`
 //! - `docs/11-host-server-side.md`
 //!
-//! Status: host process and connection manager.
+//! Status: main window, viewer, host process and connection manager.
 
 pub mod cm;
 pub mod cm_cli;
 pub mod cm_model;
+pub mod main_model;
+pub mod main_window;
+pub mod paths;
 pub mod server;
+pub mod viewer;
+pub mod viewer_model;
 
 /// Package version, shown by the binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -40,14 +56,22 @@ pub const SPEC_DOCS: &[&str] = &[
 ];
 
 const USAGE: &str = "usage:
-  kanodesk --server [--config FILE] [--data-dir DIR] [--listen ADDR]
+  kanodesk                      the main window
+  kanodesk --connect ID         a viewer window for the device with this ID
+  kanodesk --server [--config FILE] [--data-dir DIR] [--listen ADDR] [--port N]
                     [--approve-mode password|click|both] [--display N] [--no-cm-launch]
+                    [--log FILE]
   kanodesk --cm
-  kanodesk --cm-cmd list | accept ID | deny ID | disconnect ID | perms ID keyboard=on|off mouse=on|off";
+  kanodesk --cm-cmd list | accept ID | deny ID | disconnect ID | perms ID keyboard=on|off mouse=on|off
+  kanodesk --help";
 
 /// Which role the process plays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
+    /// The main window.
+    Main,
+    /// A viewer window for this device ID.
+    Connect(kanodesk_rendezvous::DeviceId),
     /// The host process.
     Server(server::ServerArgs),
     /// The connection-manager window.
@@ -61,47 +85,69 @@ pub enum Role {
 /// Picks the role from the command line (without the program name).
 pub fn parse_role(args: &[String]) -> Result<Role, String> {
     match args.first().map(String::as_str) {
+        None => Ok(Role::Main),
+        Some("--connect") => match &args[1..] {
+            [id] => id
+                .parse()
+                .map(Role::Connect)
+                .map_err(|e| format!("--connect {id}: {e}")),
+            _ => Err("--connect takes one device ID".into()),
+        },
         Some("--server") => server::parse(&args[1..]).map(Role::Server),
         Some("--cm") if args.len() == 1 => Ok(Role::Cm),
         Some("--cm") => Err("--cm takes no arguments".into()),
         Some("--cm-cmd") => cm_cli::parse(&args[1..]).map(Role::CmCmd),
-        None | Some("--help") | Some("-h") => Ok(Role::Help),
+        Some("--help") | Some("-h") => Ok(Role::Help),
         Some(other) => Err(format!("unknown role {other}")),
     }
 }
 
+/// Logs to the console, or to `file` (appended) when given.
+fn init_logging(file: Option<&std::path::Path>) {
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let opened = file.and_then(|f| {
+        if let Some(dir) = f.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(f)
+            .ok()
+    });
+    let _ = match opened {
+        Some(f) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(f))
+            .try_init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).try_init(),
+    };
+}
+
 /// Runs the process; returns its exit code.
 pub fn main_with_args(args: &[String]) -> i32 {
-    match parse_role(args) {
-        Ok(Role::Server(a)) => {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "info".into()),
-                )
-                .try_init();
-            match server::run(a) {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("kanodesk --server: {e}");
-                    1
-                }
-            }
+    let report = |role: &str, r: Result<(), String>| match r {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("kanodesk{role}: {e}");
+            tracing::error!("kanodesk{role}: {e}");
+            1
         }
-        Ok(Role::Cm) => match cm::run() {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("kanodesk --cm: {e}");
-                1
-            }
-        },
-        Ok(Role::CmCmd(cmd)) => match cm_cli::run(cmd) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("kanodesk --cm-cmd: {e}");
-                1
-            }
-        },
+    };
+    match parse_role(args) {
+        Ok(Role::Main) => report("", main_window::run()),
+        Ok(Role::Connect(id)) => {
+            init_logging(paths::log_dir().map(|d| d.join("viewer.log")).as_deref());
+            report(" --connect", viewer::run(id))
+        }
+        Ok(Role::Server(a)) => {
+            init_logging(a.log.as_deref());
+            report(" --server", server::run(a).map_err(|e| e.to_string()))
+        }
+        Ok(Role::Cm) => report(" --cm", cm::run()),
+        Ok(Role::CmCmd(cmd)) => report(" --cm-cmd", cm_cli::run(cmd)),
         Ok(Role::Help) => {
             println!(
                 "kanodesk {VERSION}
@@ -135,9 +181,17 @@ mod tests {
     #[test]
     fn roles() {
         let a = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(parse_role(&a(&[])).unwrap(), Role::Help);
+        assert_eq!(parse_role(&a(&[])).unwrap(), Role::Main);
+        assert_eq!(parse_role(&a(&["--help"])).unwrap(), Role::Help);
         assert_eq!(parse_role(&a(&["--cm"])).unwrap(), Role::Cm);
         assert!(parse_role(&a(&["--cm", "x"])).is_err());
+        assert_eq!(
+            parse_role(&a(&["--connect", "123456789"])).unwrap(),
+            Role::Connect("123456789".parse().unwrap())
+        );
+        assert!(parse_role(&a(&["--connect"])).is_err());
+        assert!(parse_role(&a(&["--connect", "12"])).is_err());
+        assert!(parse_role(&a(&["--connect", "123456789", "x"])).is_err());
         assert!(matches!(
             parse_role(&a(&["--server", "--approve-mode", "both"])).unwrap(),
             Role::Server(s) if s.approve_mode.as_deref() == Some("both")

@@ -166,6 +166,30 @@ On Windows, AddressSanitizer needs the MSVC runtime DLL on `PATH`: add `VC\Tools
 cargo +nightly fuzz run decode_frames -- -max_total_time=60
 ```
 
+### The desktop app
+
+`kanodesk` with no arguments opens the main window. It needs an ID server (and, for connections that cannot go direct, a relay); see above. On one machine for a quick try:
+
+```bash
+cargo run --release -p kanodesk-relay -- --listen 127.0.0.1:21117 --open
+```
+
+```bash
+cargo run --release -p kanodesk-idserver -- --listen 127.0.0.1:21116 --nat-test-listen 127.0.0.1:21115 --relay 127.0.0.1:21117
+```
+
+```bash
+cargo run --release -p kanodesk-desktop
+```
+
+1. **Settings** → ID server `127.0.0.1:21116` (port 21116 if omitted) and the server key the ID server printed → **Save**. The host re-reads the settings at once; nothing restarts.
+2. **Home** shows **your ID** ("Ready: reachable by ID") and the **one-time password** (Copy, **New password**). The window starts the host process (`kanodesk --server`, no console, log in `%LOCALAPPDATA%\KanoDesk\data\logs\host.log`) when none runs, and stops it when you close the window.
+3. On the controlling machine (the same machine works too, for a try), type the other device's ID and **Connect** (or press Enter). A viewer window opens (`kanodesk --connect ID`, its own process; log in `logsiewer.log`): *Connecting* with the current step, then the *password* dialog if the host wants one (again after a wrong one), or *Waiting for the remote user to accept* in click mode. A relayed connection is pointed out once.
+4. The viewer's toolbar: **display** picker (when the host has several), **Fit to window / Original size** (original size scrolls with the pointer), **quality** (Balanced, Best, Low bandwidth; shared by everyone viewing that display), **Ctrl+Alt+Del** (sent; performed once the service of prompt 11 exists), the path (LAN, direct, relayed) and fps, and **Disconnect**. Errors (unknown ID, device offline, wrong ID server key, refused, no answer, ended by the remote side, …) come as dialogs with **Try again** where it makes sense.
+5. Successful sessions appear under **Recent sessions** in the main window (Connect, ✕ to forget); they are kept in `peers.toml` next to the config, without passwords.
+
+Settings also cover the approve mode, the one-time password length, a permanent password, the default keyboard/mouse permissions for remote users, and the viewer's defaults (`view-style`, `image-quality`). The viewer registers with the ID server under its own device key (`%LOCALAPPDATA%\KanoDesk\data\client`), so it never takes over the host's ID.
+
 ### Host and connection manager
 
 `kanodesk --server` is the host process: it reads the config, keeps its device key in the key store, and accepts direct connections (UDP 21118 by default). When someone connects, it opens the connection-manager window (`kanodesk --cm`): who is connecting, **Accept**/**Deny**, keyboard and mouse toggles that apply at once, and **Disconnect**. Approval modes (`approve-mode`): `password` (the viewer needs the password; the window just shows the session), `click` (no password; you accept), `both`.

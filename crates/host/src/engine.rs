@@ -15,6 +15,9 @@
 //! 3. Accepted: `LoginResult`, then `Displays` and the session's
 //!    `Permission`s, the shared video feed of the chosen display
 //!    ([`VideoHub`]) and the input service ([`crate::input::serve_input`]).
+//!    The viewer may switch displays (`SelectDisplay`: a new video stream for
+//!    the new display replaces the old one) and pick a quality preset
+//!    (`SetImageQuality`, applied to the display's shared feed).
 //! 4. The session ends when the viewer leaves or the host's user disconnects
 //!    it ([`HostEngine::disconnect`]): the connection is closed at once, the
 //!    video subscription dropped (the producer stops when nobody watches)
@@ -23,6 +26,13 @@
 //! The engine is the authority for permissions: [`HostEngine::set_permissions`]
 //! changes them live (input follows at once, the viewer is told) and reports
 //! the result to the connection manager.
+//!
+//! Settings and passwords can change while it runs
+//! ([`HostEngine::update_settings`], [`HostEngine::refresh_temporary_password`],
+//! [`HostEngine::set_temporary_policy`], [`HostEngine::set_permanent_password`]);
+//! sessions already running keep going. Every status change goes to the
+//! connection manager and to [`HostEngine::watch_status`] subscribers (the
+//! main window).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -32,13 +42,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use kanodesk_config::ApproveMode;
-use kanodesk_crypto::password::HostPasswords;
+use kanodesk_crypto::password::{HostPasswords, TemporaryPolicy};
 use kanodesk_crypto::throttle::{self, LoginThrottle};
-use kanodesk_crypto::{DeviceIdentity, PasswordKind};
+use kanodesk_crypto::{CryptoError, DeviceIdentity, KeyStore, PasswordKind};
 use kanodesk_input::{DisplayRect, Injector, InputError, InputSink, Permissions};
 use kanodesk_ipc::cm::{HostStatus, Perms, SessionInfo, SessionState, unix_ms};
 use kanodesk_proto::hello;
-use kanodesk_proto::v1::{self, Capability, Codec, LoginError, control_message, video_message};
+use kanodesk_proto::v1::{
+    self, Capability, Codec, ImageQuality, LoginError, control_message, video_message,
+};
 use kanodesk_transport::peer::canonical;
 use kanodesk_transport::session::{HostAuth, host_login, local_peer_info};
 use kanodesk_transport::{Connection, Endpoint, endpoint, streams};
@@ -60,6 +72,8 @@ pub const HOST_CAPABILITIES: &[Capability] = &[
     Capability::InputText,
     Capability::InputRelativeMouse,
     Capability::Cursor,
+    Capability::MultiDisplay,
+    Capability::ImageQuality,
 ];
 
 /// Lists the host's displays.
@@ -139,7 +153,7 @@ struct Inner {
     passwords: Mutex<HostPasswords>,
     throttle: Mutex<LoginThrottle<IpAddr>>,
     throttle_path: Option<PathBuf>,
-    settings: EngineSettings,
+    settings: Mutex<EngineSettings>,
     cm: Arc<dyn ConnectionManager>,
     video: VideoHub,
     displays: DisplayList,
@@ -147,7 +161,7 @@ struct Inner {
     sessions: Mutex<HashMap<u64, Live>>,
     defaults: Mutex<Permissions>,
     next_id: AtomicU64,
-    last_temporary: Mutex<String>,
+    status: watch::Sender<HostStatus>,
 }
 
 /// The engine; cheap to clone.
@@ -173,14 +187,13 @@ fn from_perms(p: Perms) -> Permissions {
 impl HostEngine {
     /// Builds the engine and tells the connection manager its status.
     pub fn new(parts: EngineParts) -> HostEngine {
-        let temporary = parts.passwords.temporary().to_owned();
         let engine = HostEngine {
             inner: Arc::new(Inner {
                 identity: parts.identity,
                 passwords: Mutex::new(parts.passwords),
                 throttle: Mutex::new(parts.throttle),
                 throttle_path: parts.throttle_path,
-                settings: parts.settings.clone(),
+                settings: Mutex::new(parts.settings.clone()),
                 cm: parts.cm,
                 video: parts.video,
                 displays: parts.displays,
@@ -188,16 +201,76 @@ impl HostEngine {
                 sessions: Mutex::new(HashMap::new()),
                 defaults: Mutex::new(parts.settings.permissions),
                 next_id: AtomicU64::new(1),
-                last_temporary: Mutex::new(temporary),
+                status: watch::channel(HostStatus::default()).0,
             }),
         };
-        engine.inner.cm.status_changed(&engine.status());
+        let status = engine.inner.status();
+        engine.inner.status.send_replace(status.clone());
+        engine.inner.cm.status_changed(&status);
         engine
     }
 
     /// What the connection manager shows about this host.
     pub fn status(&self) -> HostStatus {
         self.inner.status()
+    }
+
+    /// Follows the status (new temporary password, settings).
+    pub fn watch_status(&self) -> watch::Receiver<HostStatus> {
+        self.inner.status.subscribe()
+    }
+
+    /// The current settings.
+    pub fn settings(&self) -> EngineSettings {
+        self.inner.settings()
+    }
+
+    /// Applies new settings to the next logins; running sessions keep
+    /// theirs. New sessions start with the new default permissions.
+    pub fn update_settings(&self, settings: EngineSettings) {
+        *self.inner.defaults.lock().expect("not poisoned") = settings.permissions;
+        *self.inner.settings.lock().expect("not poisoned") = settings;
+        self.inner.publish_status();
+    }
+
+    /// Replaces the temporary password now.
+    pub fn refresh_temporary_password(&self) -> Result<String, CryptoError> {
+        let new = self
+            .inner
+            .passwords
+            .lock()
+            .expect("not poisoned")
+            .rotate_temporary()?
+            .to_owned();
+        self.inner.publish_status();
+        Ok(new)
+    }
+
+    /// Switches the temporary password policy (length); the password is
+    /// replaced if the policy changed.
+    pub fn set_temporary_policy(&self, policy: TemporaryPolicy) -> Result<(), CryptoError> {
+        self.inner
+            .passwords
+            .lock()
+            .expect("not poisoned")
+            .set_policy(policy)?;
+        self.inner.publish_status();
+        Ok(())
+    }
+
+    /// Sets (`Some`) or clears (`None`) the permanent password, saved in `store`.
+    pub fn set_permanent_password(
+        &self,
+        password: Option<&str>,
+        store: &dyn KeyStore,
+    ) -> Result<(), CryptoError> {
+        self.inner
+            .passwords
+            .lock()
+            .expect("not poisoned")
+            .set_permanent(password, store)?;
+        self.inner.publish_status();
+        Ok(())
     }
 
     /// The current temporary password.
@@ -302,23 +375,43 @@ impl HostEngine {
 }
 
 impl Inner {
+    fn settings(&self) -> EngineSettings {
+        self.settings.lock().expect("not poisoned").clone()
+    }
+
     fn status(&self) -> HostStatus {
+        let settings = self.settings();
+        let passwords = self.passwords.lock().expect("not poisoned");
         HostStatus {
             device_key: self.identity.public_key().to_string(),
-            temporary_password: self.settings.approve_mode.needs_password().then(|| {
-                self.passwords
-                    .lock()
-                    .expect("not poisoned")
-                    .temporary()
-                    .to_owned()
-            }),
-            approve_mode: match self.settings.approve_mode {
+            temporary_password: settings
+                .approve_mode
+                .needs_password()
+                .then(|| passwords.temporary().to_owned()),
+            approve_mode: match settings.approve_mode {
                 ApproveMode::Password => "password",
                 ApproveMode::Click => "click",
                 ApproveMode::Both => "both",
             }
             .to_owned(),
-            listen: self.settings.listen.clone(),
+            listen: settings.listen.clone(),
+            has_permanent_password: passwords.has_permanent(),
+        }
+    }
+
+    /// Reports the status to the connection manager and the watchers, if it
+    /// changed.
+    fn publish_status(&self) {
+        let now = self.status();
+        let changed = self.status.send_if_modified(|s| {
+            let changed = *s != now;
+            if changed {
+                *s = now.clone();
+            }
+            changed
+        });
+        if changed {
+            self.cm.status_changed(&now);
         }
     }
 
@@ -330,21 +423,7 @@ impl Inner {
                 tracing::warn!("saving login limits: {e}");
             }
         }
-        let now = self
-            .passwords
-            .lock()
-            .expect("not poisoned")
-            .temporary()
-            .to_owned();
-        let changed = {
-            let mut last = self.last_temporary.lock().expect("not poisoned");
-            let changed = *last != now;
-            *last = now;
-            changed
-        };
-        if changed {
-            self.cm.status_changed(&self.status());
-        }
+        self.publish_status();
     }
 
     fn update(&self, info: &SessionInfo) {
@@ -383,15 +462,16 @@ async fn close_after_refusal(conn: &Connection, reason: &[u8]) {
 async fn session(inner: Arc<Inner>, conn: Connection) {
     let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
     let peer = canonical(conn.remote_address());
-    let ours = hello::hello(HOST_CAPABILITIES, &inner.settings.agent);
-    let peer_info = local_peer_info(&inner.settings.agent, &[Codec::Vp9]);
+    let settings = inner.settings();
+    let ours = hello::hello(HOST_CAPABILITIES, &settings.agent);
+    let peer_info = local_peer_info(&settings.agent, &[Codec::Vp9]);
     let auth = HostAuth {
         identity: &inner.identity,
         passwords: &inner.passwords,
         throttle: &inner.throttle,
         peer_info: peer_info.clone(),
     };
-    let mode = inner.settings.approve_mode;
+    let mode = settings.approve_mode;
     let login = tokio::time::timeout(
         LOGIN_TIMEOUT,
         host_login(&conn, &auth, &ours, mode.needs_password()),
@@ -452,14 +532,14 @@ async fn session(inner: Arc<Inner>, conn: Connection) {
 
     if mode.needs_click() {
         info.state = SessionState::AwaitingApproval {
-            accept_after_unix_ms: unix_ms(now + inner.settings.click_delay),
-            expires_unix_ms: unix_ms(now + inner.settings.approve_timeout),
+            accept_after_unix_ms: unix_ms(now + settings.click_delay),
+            expires_unix_ms: unix_ms(now + settings.approve_timeout),
         };
         inner.update(&info);
         let _ = pending.notify_pending().await;
         let ask = inner.cm.request_approval(&info);
         let decision = tokio::select! {
-            d = tokio::time::timeout(inner.settings.approve_timeout, ask) => d.ok().flatten(),
+            d = tokio::time::timeout(settings.approve_timeout, ask) => d.ok().flatten(),
             _ = pending.closed() => {
                 inner.finish(info, "the viewer gave up waiting");
                 endpoint::close(&conn, b"gone");
@@ -521,7 +601,7 @@ async fn session(inner: Arc<Inner>, conn: Connection) {
     );
 
     let reason = tokio::select! {
-        r = run_services(&inner, &conn, host_session, perm_rx) => r,
+        r = run_services(&inner, &conn, host_session, perm_rx, settings.display) => r,
         r = end_rx.wait_for(Option::is_some) => match r {
             Ok(reason) => reason.clone().unwrap_or_default(),
             Err(_) => "ended".to_owned(),
@@ -542,13 +622,12 @@ async fn run_services(
         kanodesk_transport::SendStream,
     >,
     mut perms: watch::Receiver<Permissions>,
+    preferred: Option<u32>,
 ) -> String {
     let send_cursor = session.negotiated.has(Capability::Cursor);
     let mut control = session.control;
     let displays = inner.display_list();
-    let display = inner
-        .settings
-        .display
+    let mut display = preferred
         .filter(|d| displays.iter().any(|i| i.id == *d))
         .or_else(|| displays.iter().find(|d| d.primary).map(|d| d.id))
         .or_else(|| displays.first().map(|d| d.id))
@@ -607,12 +686,40 @@ async fn run_services(
         Err(e) => return format!("video stream: {e}"),
     };
     let mut watching = true;
+    // The viewer's quality choice, carried over when it switches displays.
+    let mut quality: Option<ImageQuality> = None;
     loop {
         tokio::select! {
             msg = control.recv() => match msg {
                 Ok(Some(m)) => match m.msg {
                     Some(control_message::Msg::KeyframeRequest(_)) => feed.request_keyframe(),
                     Some(control_message::Msg::Close(_)) => return "the viewer closed the session".into(),
+                    Some(control_message::Msg::SelectDisplay(s)) => {
+                        let Some(&wanted) = s.ids.first() else { continue };
+                        if wanted == display || !displays.iter().any(|d| d.id == wanted) {
+                            continue;
+                        }
+                        // Subscribe first so the new producer warms up while
+                        // the stream opens; the old stream ends cleanly.
+                        let next = inner.video.subscribe(wanted);
+                        if let Some(q) = quality {
+                            next.set_quality(q);
+                        }
+                        let stream = match streams::open_video(conn, wanted).await {
+                            Ok(v) => v,
+                            Err(e) => return format!("video stream: {e}"),
+                        };
+                        let old = std::mem::replace(&mut video, stream);
+                        let _ = old.into_inner().finish();
+                        feed = next;
+                        display = wanted;
+                        tracing::debug!("session switched to display {wanted}");
+                    }
+                    Some(control_message::Msg::SetImageQuality(q)) => {
+                        let q = ImageQuality::try_from(q.quality).unwrap_or(ImageQuality::Balanced);
+                        quality = Some(q);
+                        feed.set_quality(q);
+                    }
                     _ => {}
                 },
                 Ok(None) => return "the viewer closed the session".into(),

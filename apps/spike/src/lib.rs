@@ -23,7 +23,6 @@
 //!
 //! Status: phase 0 spike (see `PROGRESS.md`).
 
-pub mod overlay;
 pub mod render;
 pub mod stats;
 
