@@ -14,8 +14,10 @@
 //!    its relay binding fresh while it lives.
 //!
 //! When the ID server connection drops or an attempt fails, it retries with
-//! a growing pause (2 s up to 60 s). [`Presence::status`] reports the state
-//! and the ID for the main window. Dropping the [`Presence`] stops it;
+//! a growing pause (2 s up to 60 s). A failure stays reported while it
+//! retries, so the main window says "offline, retrying" instead of
+//! "connecting" for most of an outage. [`Presence::status`] reports the
+//! state and the ID for the main window. Dropping the [`Presence`] stops it;
 //! sessions already running keep their connections.
 
 use std::path::PathBuf;
@@ -109,6 +111,15 @@ fn set_state(tx: &watch::Sender<PresenceStatus>, state: IdServerState) {
     });
 }
 
+/// The state to show when an attempt starts: a failure stays visible (the
+/// main window says it is retrying) until an attempt succeeds.
+fn attempt_state(previous: &IdServerState) -> Option<IdServerState> {
+    match previous {
+        IdServerState::Failed(_) => None,
+        _ => Some(IdServerState::Connecting),
+    }
+}
+
 async fn run(
     engine: HostEngine,
     identity: DeviceIdentity,
@@ -141,7 +152,10 @@ async fn run(
 
     let mut pause = FIRST_RETRY;
     loop {
-        set_state(&tx, IdServerState::Connecting);
+        let previous = tx.borrow().state.clone();
+        if let Some(state) = attempt_state(&previous) {
+            set_state(&tx, state);
+        }
         match serve(&identity, &config, &socket, &prepared, &tx).await {
             Ok(()) => {
                 tracing::info!("lost the ID server connection; reconnecting");
@@ -264,5 +278,25 @@ struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failure_stays_shown_while_retrying() {
+        assert_eq!(
+            attempt_state(&IdServerState::Failed("timed out".into())),
+            None
+        );
+        for s in [
+            IdServerState::Connecting,
+            IdServerState::Online,
+            IdServerState::NotConfigured,
+        ] {
+            assert_eq!(attempt_state(&s), Some(IdServerState::Connecting), "{s:?}");
+        }
     }
 }

@@ -140,6 +140,9 @@ egui = "0.36"
 egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links"] }
 egui-wgpu = { version = "0.36", default-features = false }
 
+# Windows resources (the executable icon)
+embed-resource = "3.0"
+
 # Logging, errors, CLI
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -41,6 +41,7 @@ Every statement in these docs carries one of these tags:
 |---|---|---|
 | 00 | [00-review.md](00-review.md) | Review: gaps, bottlenecks, missing coverage, open accuracy issues |
 | — | [next-session-prompts.md](next-session-prompts.md) | Copy-paste prompts for building the clone (phase 0 spike → phase 1 MVP), one per message |
+| — | [ui-refinement-plan.md](ui-refinement-plan.md) | Plan for the 2026-10-13 UI audit: theme, truthful status and errors, Home, Settings, connection manager, keyboard and screen readers, streaming view |
 | 01 | [01-feature-inventory.md](01-feature-inventory.md) | Every main and secondary feature, with links to how it works |
 | 02 | [02-architecture.md](02-architecture.md) | Processes, module tree, crates, threading, the Flutter↔Rust bridge |
 | 03 | [03-networking-rendezvous.md](03-networking-rendezvous.md) | ID server, NAT detection, TCP/UDP hole punching, relay, WebSocket, KCP, LAN discovery, direct IP |

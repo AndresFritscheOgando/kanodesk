@@ -767,6 +767,8 @@ impl App {
                 self.update_grab();
                 println!("keyboard mode {mode:?}");
             }
+            // Fullscreen is the kanodesk viewer's; the spike window stays as it is.
+            ViewerCommand::ToggleFullscreen => println!("fullscreen: not in the spike viewer"),
         }
         self.refresh_cursor(event_loop);
     }

@@ -399,6 +399,8 @@ pub enum ViewerCommand {
     ToggleRelativeMouse,
     /// Ctrl+Alt+Shift+K: switch between Map and Translate mode.
     ToggleKeyboardMode,
+    /// Ctrl+Alt+Shift+F: enter or leave fullscreen.
+    ToggleFullscreen,
 }
 
 /// One key from the window or the keyboard grab.
@@ -427,6 +429,7 @@ pub struct KeyOutcome {
 const END: KeyCode = KeyCode(0x4D);
 const KEY_M: KeyCode = KeyCode(0x10);
 const KEY_K: KeyCode = KeyCode(0x0E);
+const KEY_F: KeyCode = KeyCode(0x09);
 
 /// Turns window events into input events; see the module docs.
 #[derive(Debug)]
@@ -692,6 +695,7 @@ impl ViewerInput {
             END if !shift => Some(ViewerCommand::CtrlAltDel),
             KEY_M if shift => Some(ViewerCommand::ToggleRelativeMouse),
             KEY_K if shift => Some(ViewerCommand::ToggleKeyboardMode),
+            KEY_F if shift => Some(ViewerCommand::ToggleFullscreen),
             _ => None,
         }
     }
@@ -1303,6 +1307,9 @@ mod tests {
             press(&mut v, 0x0E, true).command,
             Some(ViewerCommand::ToggleKeyboardMode)
         );
+        let o = press(&mut v, 0x09, true);
+        assert_eq!(o.command, Some(ViewerCommand::ToggleFullscreen));
+        assert!(o.events.is_empty(), "the chord's F is not sent");
         // Without Ctrl+Alt these are ordinary keys.
         let mut v = viewer();
         assert_eq!(press(&mut v, 0x4D, true).command, None);

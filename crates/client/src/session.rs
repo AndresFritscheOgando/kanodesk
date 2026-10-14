@@ -180,6 +180,8 @@ pub enum SessionEvent {
 pub enum EndReason {
     /// The user closed it.
     Closed,
+    /// No ID server address or key is configured.
+    NoIdServer,
     /// The ID server could not be reached or refused this viewer.
     IdServer(String),
     /// The server at that address does not hold the configured key.
@@ -221,6 +223,17 @@ pub struct Notice {
     pub retry: bool,
     /// Whether it is an error (or just the end of a session).
     pub error: bool,
+    /// The raw error, for a "Details" section (None when the text says it all).
+    pub detail: Option<String>,
+    /// An extra action the dialog offers.
+    pub action: Option<NoticeAction>,
+}
+
+/// An extra action an end dialog offers besides Try again and Close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeAction {
+    /// Open the main window's Settings (ID server address and key).
+    OpenSettings,
 }
 
 fn notice(title: &str, text: impl Into<String>, retry: bool) -> Notice {
@@ -229,6 +242,51 @@ fn notice(title: &str, text: impl Into<String>, retry: bool) -> Notice {
         text: text.into(),
         retry,
         error: true,
+        detail: None,
+        action: None,
+    }
+}
+
+impl Notice {
+    fn detail(mut self, raw: &str) -> Notice {
+        self.detail = Some(raw.to_owned());
+        self
+    }
+
+    fn settings(mut self) -> Notice {
+        self.action = Some(NoticeAction::OpenSettings);
+        self
+    }
+}
+
+/// A raw network error in plain words, to finish a sentence such as "The
+/// ID server …": "did not answer", "could not be found". The raw text
+/// belongs in a "Details" section next to it.
+pub fn plain_cause(raw: &str) -> &'static str {
+    let r = raw.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| r.contains(w));
+    if has(&[
+        "cannot resolve",
+        "lookup",
+        "no such host",
+        "invalid server name",
+        "name or service",
+    ]) {
+        "could not be found (check the address)"
+    } else if has(&["unreachable", "no route"]) {
+        "is not reachable from this network"
+    } else if has(&["refused"]) {
+        "refused the connection"
+    } else if has(&["timed out", "timeout"]) {
+        "did not answer"
+    } else if has(&["reset", "aborted", "closed"]) {
+        "closed the connection"
+    } else if has(&["pinned", "certificate", "tls", "fingerprint", "handshake"]) {
+        "could not set up a secure connection"
+    } else if has(&["supported version"]) {
+        "runs an incompatible version"
+    } else {
+        "ran into an error (see Details)"
     }
 }
 
@@ -240,18 +298,28 @@ impl EndReason {
                 error: false,
                 ..notice("Disconnected", "You closed the session.", true)
             },
+            EndReason::NoIdServer => notice(
+                "No ID server set",
+                "Set the ID server address and key in Settings, then try again.",
+                false,
+            )
+            .settings(),
             EndReason::IdServer(e) => notice(
-                "ID server unreachable",
+                "Can't reach the ID server",
                 format!(
-                    "Could not use the ID server: {e}. Check the address in Settings and your network."
+                    "The ID server {}. Check its address in Settings and that this computer is online.",
+                    plain_cause(e)
                 ),
                 true,
-            ),
+            )
+            .detail(e)
+            .settings(),
             EndReason::ServerNotTrusted => notice(
                 "Wrong ID server key",
                 "The ID server did not prove it holds the key in Settings. Check the server key; someone may be impersonating the server.",
                 false,
-            ),
+            )
+            .settings(),
             EndReason::UnknownId => notice(
                 "Unknown ID",
                 "No device has this ID. Check the number.",
@@ -279,10 +347,14 @@ impl EndReason {
                 true,
             ),
             EndReason::Unreachable(e) => notice(
-                "Cannot reach the device",
-                format!("No direct or relayed connection worked ({e})."),
+                "Can't reach the device",
+                format!(
+                    "Neither a direct nor a relayed connection worked: the device {}.",
+                    plain_cause(e)
+                ),
                 true,
-            ),
+            )
+            .detail(e),
             EndReason::HostKeyMismatch => notice(
                 "Device identity mismatch",
                 "The device that answered is not the one registered under this ID. The connection was stopped.",
@@ -300,11 +372,10 @@ impl EndReason {
             ),
             EndReason::Incompatible(e) => notice(
                 "Incompatible versions",
-                format!(
-                    "This KanoDesk and the remote one cannot talk to each other ({e}). Update one of them."
-                ),
+                "This KanoDesk and the remote one cannot talk to each other. Update one of them.",
                 false,
-            ),
+            )
+            .detail(e),
             EndReason::HostEnded(why) => Notice {
                 error: false,
                 ..notice(
@@ -319,10 +390,16 @@ impl EndReason {
             },
             EndReason::ConnectionLost(e) => notice(
                 "Connection lost",
-                format!("The connection to the device broke ({e})."),
+                format!("The connection to the device broke: it {}.", plain_cause(e)),
                 true,
-            ),
-            EndReason::Failed(e) => notice("Connection failed", e.clone(), true),
+            )
+            .detail(e),
+            EndReason::Failed(e) => notice(
+                "Connection failed",
+                "Something went wrong while connecting.",
+                true,
+            )
+            .detail(e),
         }
     }
 }
@@ -977,10 +1054,54 @@ mod tests {
     }
 
     #[test]
+    fn plain_causes() {
+        for (raw, plain) in [
+            ("transport: connection: timed out", "did not answer"),
+            ("request timed out", "did not answer"),
+            ("Relay: timed out", "did not answer"),
+            (
+                "cannot resolve the ID server ids.example",
+                "could not be found",
+            ),
+            (
+                "transport: connect: invalid server name: x",
+                "could not be found",
+            ),
+            (
+                "transport: I/O: A socket operation was attempted to an unreachable network. (os error 10051)",
+                "not reachable",
+            ),
+            (
+                "transport: I/O: connection refused (os error 111)",
+                "refused",
+            ),
+            (
+                "connection to the ID server closed",
+                "closed the connection",
+            ),
+            (
+                "transport: connection: reset by peer",
+                "closed the connection",
+            ),
+            ("ID server is not the pinned server", "secure connection"),
+            ("transport: certificate: bad", "secure connection"),
+            (
+                "transport: connection: peer doesn't implement any supported version",
+                "incompatible version",
+            ),
+            ("boom", "see Details"),
+        ] {
+            let got = plain_cause(raw);
+            assert!(got.contains(plain), "{raw} -> {got}");
+        }
+    }
+
+    #[test]
     fn every_reason_has_a_notice() {
         let all = [
             EndReason::Closed,
-            EndReason::IdServer("x".into()),
+            EndReason::NoIdServer,
+            EndReason::IdServer("transport: connection: timed out".into()),
             EndReason::ServerNotTrusted,
             EndReason::UnknownId,
             EndReason::OwnId,
@@ -1000,7 +1121,32 @@ mod tests {
         for r in all {
             let n = r.notice();
             assert!(!n.title.is_empty() && !n.text.is_empty(), "{r:?}");
+            for raw in ["transport:", "connection:", "Relay:"] {
+                assert!(!n.text.contains(raw), "{r:?}: raw error in {:?}", n.text);
+            }
+            let has_raw = matches!(
+                r,
+                EndReason::IdServer(_)
+                    | EndReason::Unreachable(_)
+                    | EndReason::Incompatible(_)
+                    | EndReason::ConnectionLost(_)
+                    | EndReason::Failed(_)
+            );
+            assert_eq!(n.detail.is_some(), has_raw, "{r:?}");
         }
+        let id_server = EndReason::IdServer("transport: connection: timed out".into()).notice();
+        assert!(
+            id_server.text.contains("did not answer"),
+            "{}",
+            id_server.text
+        );
+        assert_eq!(id_server.action, Some(NoticeAction::OpenSettings));
+        assert_eq!(
+            EndReason::NoIdServer.notice().action,
+            Some(NoticeAction::OpenSettings)
+        );
+        assert!(!EndReason::NoIdServer.notice().retry);
+        assert_eq!(EndReason::Denied.notice().action, None);
         assert_eq!(
             EndReason::RateLimited(Some(Duration::from_millis(2100)))
                 .notice()

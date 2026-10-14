@@ -13,6 +13,8 @@ use kanodesk_client::session::{
 use kanodesk_input::Permissions;
 use kanodesk_proto::v1::{DisplayInfo, ImageQuality};
 
+use crate::main_model::Level;
+
 /// How long a toolbar message stays.
 pub const TOAST: Duration = Duration::from_secs(6);
 
@@ -56,6 +58,10 @@ pub struct ViewerModel {
     pub toast: Option<(String, Instant)>,
     /// Frames shown in the last full second.
     pub fps: u32,
+    /// The ID server's address, when one is set (for the dialogs).
+    pub server: Option<String>,
+    /// When the current connecting stage began.
+    pub stage_since: Option<Instant>,
     frames: u32,
     second: Option<Instant>,
 }
@@ -76,6 +82,8 @@ impl ViewerModel {
             quality,
             toast: None,
             fps: 0,
+            server: None,
+            stage_since: None,
             frames: 0,
             second: None,
         }
@@ -83,7 +91,20 @@ impl ViewerModel {
 
     /// Starts over (Try again).
     pub fn restart(&mut self) {
+        let server = self.server.take();
         *self = ViewerModel::new(std::mem::take(&mut self.id), self.view, self.quality);
+        self.server = server;
+    }
+
+    /// The session (re)started at `now`: the first stage's clock starts.
+    pub fn started(&mut self, now: Instant) {
+        self.stage_since = Some(now);
+    }
+
+    /// How long the current connecting stage has taken.
+    pub fn stage_waited(&self, now: Instant) -> Duration {
+        self.stage_since
+            .map_or(Duration::ZERO, |t| now.saturating_duration_since(t))
     }
 
     /// Applies a session event.
@@ -91,6 +112,9 @@ impl ViewerModel {
         match event {
             SessionEvent::Stage(s) => {
                 if matches!(self.phase, Phase::Starting(_) | Phase::Password(_)) {
+                    if self.phase != Phase::Starting(*s) || self.stage_since.is_none() {
+                        self.stage_since = Some(now);
+                    }
                     self.phase = Phase::Starting(*s);
                 }
             }
@@ -165,20 +189,140 @@ impl ViewerModel {
         }
     }
 
-    /// What the toolbar says about the session.
-    pub fn status_text(&self) -> String {
-        let mut parts = Vec::new();
+    /// The toolbar's status chips while streaming: how the connection
+    /// runs (relayed in amber), view only, frame rate.
+    pub fn status_chips(&self) -> Vec<Chip> {
+        let mut chips = Vec::new();
         if let Some(p) = self.path {
-            parts.push(path_text(p).to_owned());
+            let level = if p == PathKind::Relay {
+                Level::Busy
+            } else {
+                Level::Idle
+            };
+            chips.push(Chip {
+                text: path_chip(p).to_owned(),
+                level,
+            });
         }
         if self.phase == Phase::Streaming {
             if self.permissions == Permissions::NONE {
-                parts.push("view only".to_owned());
+                chips.push(Chip {
+                    text: "View only".to_owned(),
+                    level: Level::Busy,
+                });
             }
-            parts.push(format!("{} fps", self.fps));
+            chips.push(Chip {
+                text: format!("{} fps", self.fps),
+                level: Level::Idle,
+            });
         }
-        parts.join(" · ")
+        chips
     }
+
+    /// What the toolbar shows in the current phase. Before the session
+    /// streams, the dialog in front carries the actions (Cancel, Close), so
+    /// the toolbar only says where things stand.
+    pub fn toolbar(&self) -> ToolbarSpec {
+        match &self.phase {
+            Phase::Starting(stage) => ToolbarSpec {
+                controls: false,
+                status: stage_text(*stage).trim_end_matches('…').to_owned(),
+                disconnect: false,
+            },
+            Phase::Password(_) => ToolbarSpec {
+                controls: false,
+                status: "Password needed".to_owned(),
+                disconnect: false,
+            },
+            Phase::Streaming => ToolbarSpec {
+                controls: true,
+                status: String::new(),
+                disconnect: true,
+            },
+            Phase::Ended(_) => ToolbarSpec {
+                controls: false,
+                status: "Ended".to_owned(),
+                disconnect: false,
+            },
+        }
+    }
+}
+
+/// What the viewer's toolbar shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolbarSpec {
+    /// Display, view and quality pickers, the actions and the status chips.
+    pub controls: bool,
+    /// The status text after the ID (empty while streaming: chips instead).
+    pub status: String,
+    /// Whether the Disconnect button shows.
+    pub disconnect: bool,
+}
+
+/// A small status label in the toolbar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chip {
+    /// What it says.
+    pub text: String,
+    /// Its colour.
+    pub level: Level,
+}
+
+/// A path as a toolbar chip.
+pub fn path_chip(path: PathKind) -> &'static str {
+    match path {
+        PathKind::Lan => "LAN",
+        PathKind::Ipv6 => "Direct (IPv6)",
+        PathKind::Direct => "Direct",
+        PathKind::Relay => "Relayed",
+    }
+}
+
+/// How close to the top edge (points) the pointer reveals the fullscreen toolbar.
+pub const REVEAL_EDGE: f32 = 6.0;
+/// How long the fullscreen toolbar stays after the pointer leaves it.
+pub const TOOLBAR_LINGER: Duration = Duration::from_millis(1500);
+
+/// Whether the fullscreen toolbar is wanted right now: pinned, under the
+/// pointer, or the pointer at the top edge.
+pub fn toolbar_wanted(pinned: bool, over_toolbar: bool, pointer_y: Option<f32>) -> bool {
+    pinned || over_toolbar || pointer_y.is_some_and(|y| y <= REVEAL_EDGE)
+}
+
+/// Whether the fullscreen toolbar shows: while wanted, and for
+/// [`TOOLBAR_LINGER`] after it last was.
+pub fn toolbar_visible(wanted: bool, last_wanted: Option<Instant>, now: Instant) -> bool {
+    wanted || last_wanted.is_some_and(|t| now.saturating_duration_since(t) < TOOLBAR_LINGER)
+}
+
+/// How long a connecting stage may take before the dialog explains.
+pub const SLOW_STAGE: Duration = Duration::from_secs(8);
+
+/// A hint for a connecting stage that takes long; None at first, and
+/// never while waiting for the remote user (people take their time).
+pub fn slow_hint(stage: Stage, waited: Duration, server: Option<&str>) -> Option<String> {
+    if waited < SLOW_STAGE {
+        return None;
+    }
+    match stage {
+        Stage::IdServer => Some(match server {
+            Some(s) => format!(
+                "The ID server at {s} has not answered yet. It may be offline or blocked by a firewall."
+            ),
+            None => {
+                "The ID server has not answered yet. It may be offline or blocked by a firewall."
+                    .to_owned()
+            }
+        }),
+        Stage::Connecting => Some("Trying direct and relayed paths to the device…".to_owned()),
+        Stage::LoggingIn => Some("This is taking longer than usual.".to_owned()),
+        Stage::WaitingForApproval => None,
+    }
+}
+
+/// The seconds a stage has taken, once worth showing ("12 s").
+pub fn waited_text(waited: Duration) -> Option<String> {
+    (waited >= Duration::from_secs(3)).then(|| format!("{} s", waited.as_secs()))
 }
 
 /// The connecting dialog's text for a stage.
@@ -277,7 +421,19 @@ mod tests {
         // A late stage event does not reopen the dialog.
         m.apply(&SessionEvent::Stage(Stage::LoggingIn), t);
         assert_eq!(m.phase, Phase::Streaming);
-        assert_eq!(m.status_text(), "relayed · view only · 0 fps");
+        let chips: Vec<_> = m
+            .status_chips()
+            .into_iter()
+            .map(|c| (c.text, c.level))
+            .collect();
+        assert_eq!(
+            chips,
+            [
+                ("Relayed".to_owned(), Level::Busy),
+                ("View only".to_owned(), Level::Busy),
+                ("0 fps".to_owned(), Level::Idle),
+            ]
+        );
         m.apply(&SessionEvent::Permissions(Permissions::ALL), t);
         m.apply(&SessionEvent::VideoStarted(1), t);
         assert_eq!(m.display, Some(1));
@@ -289,6 +445,96 @@ mod tests {
         assert_eq!(m.phase, Phase::Starting(Stage::IdServer));
         assert_eq!(m.id, "123 456 789");
         assert!(m.remote.is_none());
+    }
+
+    #[test]
+    fn connecting_progress() {
+        let t = Instant::now();
+        let mut m = model();
+        m.server = Some("10.0.0.31".into());
+        assert_eq!(m.stage_waited(t), Duration::ZERO, "not started");
+        m.started(t);
+        let later = t + Duration::from_secs(12);
+        assert_eq!(m.stage_waited(later), Duration::from_secs(12));
+        // The same stage again keeps its clock; a new stage restarts it.
+        m.apply(
+            &SessionEvent::Stage(Stage::IdServer),
+            t + Duration::from_secs(5),
+        );
+        assert_eq!(m.stage_waited(later), Duration::from_secs(12));
+        m.apply(
+            &SessionEvent::Stage(Stage::Connecting),
+            t + Duration::from_secs(10),
+        );
+        assert_eq!(m.stage_waited(later), Duration::from_secs(2));
+        m.restart();
+        assert_eq!(m.server.as_deref(), Some("10.0.0.31"), "kept for Try again");
+        assert!(m.stage_since.is_none());
+
+        let s = Some("10.0.0.31");
+        assert_eq!(slow_hint(Stage::IdServer, Duration::from_secs(7), s), None);
+        let hint = slow_hint(Stage::IdServer, SLOW_STAGE, s).unwrap();
+        assert!(
+            hint.contains("10.0.0.31") && hint.contains("firewall"),
+            "{hint}"
+        );
+        assert!(
+            !slow_hint(Stage::IdServer, SLOW_STAGE, None)
+                .unwrap()
+                .contains(" at ")
+        );
+        assert!(slow_hint(Stage::Connecting, SLOW_STAGE, s).is_some());
+        assert!(slow_hint(Stage::LoggingIn, SLOW_STAGE, s).is_some());
+        assert_eq!(
+            slow_hint(Stage::WaitingForApproval, Duration::from_secs(600), s),
+            None
+        );
+        assert_eq!(waited_text(Duration::from_secs(2)), None);
+        assert_eq!(
+            waited_text(Duration::from_millis(12_400)),
+            Some("12 s".into())
+        );
+    }
+
+    #[test]
+    fn toolbar_by_phase() {
+        let t = Instant::now();
+        let mut m = model();
+        let spec = m.toolbar();
+        assert!(!spec.controls && !spec.disconnect);
+        assert_eq!(spec.status, "Contacting the ID server");
+        m.apply(&SessionEvent::PasswordNeeded(PasswordPrompt::Required), t);
+        assert_eq!(m.toolbar().status, "Password needed");
+        assert!(!m.toolbar().controls);
+        m.apply(&SessionEvent::LoggedIn(RemoteHost::default()), t);
+        let spec = m.toolbar();
+        assert!(spec.controls && spec.disconnect);
+        m.apply(&SessionEvent::Ended(EndReason::Closed), t);
+        let spec = m.toolbar();
+        assert!(!spec.controls && !spec.disconnect);
+        assert_eq!(spec.status, "Ended");
+    }
+
+    #[test]
+    fn fullscreen_toolbar_timing() {
+        let t = Instant::now();
+        assert!(toolbar_wanted(true, false, None), "pinned");
+        assert!(
+            toolbar_wanted(false, true, Some(300.0)),
+            "under the pointer"
+        );
+        assert!(toolbar_wanted(false, false, Some(2.0)), "top edge");
+        assert!(!toolbar_wanted(false, false, Some(40.0)));
+        assert!(!toolbar_wanted(false, false, None));
+        assert!(toolbar_visible(true, None, t));
+        assert!(!toolbar_visible(false, None, t));
+        assert!(toolbar_visible(
+            false,
+            Some(t),
+            t + Duration::from_millis(1000)
+        ));
+        assert!(!toolbar_visible(false, Some(t), t + TOOLBAR_LINGER));
+        assert_eq!(path_chip(PathKind::Lan), "LAN");
     }
 
     #[test]
