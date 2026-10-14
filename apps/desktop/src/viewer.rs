@@ -9,19 +9,30 @@
 //!   ([`kanodesk_client::render::VideoPipeline`]), drawn into the area below
 //!   the toolbar, fitted or at the original size (then it scrolls with the
 //!   pointer). egui is drawn on top in the same frame, on the same device.
-//! - **Toolbar**: display picker, fit / original size, quality preset,
-//!   Ctrl+Alt+Del (the host performs it once its service exists), how the
-//!   connection runs (LAN, direct, relayed), fps, and Disconnect.
-//! - **Dialogs**: connecting (with the stage), password (asked when the
-//!   host wants one, again after a wrong one), relayed connection (a note),
-//!   and every way a session can fail or end, with Try again.
+//! - **Toolbar**: while streaming, the display picker, fit / original
+//!   size, quality preset, an actions menu (Ctrl+Alt+Del, keyboard mode,
+//!   relative mouse, fullscreen, each with its shortcut), status chips (LAN,
+//!   direct, relayed, view only, fps) and Disconnect. Before that it only
+//!   says where the session stands; the dialog in front holds the actions.
+//!   In fullscreen the toolbar floats over the video and shows when the
+//!   pointer reaches the top edge (or when pinned). Toasts show at the
+//!   bottom.
+//! - **Dialogs**: connecting (with the stage, the time taken and a hint
+//!   when a stage is slow), password (asked when the host wants one, again
+//!   after a wrong one), relayed connection (a note), and every way a
+//!   session can fail or end, in plain words with the raw error under
+//!   Details, Try again and, for ID-server problems, Open Settings. Enter
+//!   runs the main button, Esc cancels or closes.
 //! - **Input**: raw winit events, as in the spike: positions mapped through
 //!   the same layout the renderer draws, keys by physical position, the
 //!   Windows keyboard grab for system keys while the window is in front,
-//!   relative mouse and Translate mode by shortcut
-//!   (Ctrl+Alt+Shift+M / +K; Ctrl+Alt+End sends Ctrl+Alt+Del). Nothing goes
+//!   relative mouse, Translate mode and fullscreen by shortcut
+//!   (Ctrl+Alt+Shift+M / +K / +F; Ctrl+Alt+End sends Ctrl+Alt+Del) or from
+//!   the actions menu. Nothing goes
 //!   to the host while a dialog is open, the pointer is over the toolbar,
 //!   or a text field has the keyboard.
+//! - **Screen readers**: the toolbar and dialogs are exposed through
+//!   AccessKit (the window starts hidden until the adapter is in place).
 //! - The host's pointer: this window's pointer takes its shape over the
 //!   video while controlling; in view-only and relative modes it is drawn
 //!   into the picture.
@@ -37,7 +48,9 @@ use kanodesk_client::input::{
 };
 use kanodesk_client::peers::{RecentPeer, RecentPeers};
 use kanodesk_client::render::VideoPipeline;
-use kanodesk_client::session::{EndReason, Session, SessionConfig, SessionEvent, Target};
+use kanodesk_client::session::{
+    EndReason, NoticeAction, PasswordPrompt, Session, SessionConfig, SessionEvent, Stage, Target,
+};
 use kanodesk_config::Config;
 use kanodesk_crypto::{DeviceIdentity, DevicePublicKey};
 use kanodesk_input::grab::{GrabbedKey, KeyboardGrab};
@@ -49,24 +62,35 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, DeviceId as WinitDeviceId, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::{CursorGrabMode, CursorIcon, CustomCursor, Window, WindowId};
+use winit::window::{CursorGrabMode, CursorIcon, CustomCursor, Fullscreen, Window, WindowId};
+
+use egui::{Align, Align2, CornerRadius, Frame, Key, Layout, Margin, Modifiers, RichText, Stroke};
 
 use crate::main_window::{quality_label, view_label};
+use crate::theme::{palette, palette_for};
 use crate::viewer_model::{
-    Phase, ViewerModel, display_label, password_text, path_text, quality_from_config, stage_text,
-    view_from_config,
+    Phase, TOAST, TOOLBAR_LINGER, ViewerModel, display_label, password_text, path_text,
+    quality_from_config, slow_hint, stage_text, toolbar_visible, toolbar_wanted, view_from_config,
+    waited_text,
 };
+use crate::widgets;
 
-/// Toolbar height in points.
-const TOOLBAR: f32 = 34.0;
+/// Docked toolbar height in points.
+const TOOLBAR: f32 = 40.0;
+/// Below this toolbar width the view and quality pickers move into the
+/// actions menu.
+const NARROW: f32 = 760.0;
 
 /// Where to connect and with which identity; kept for Try again.
 struct Setup {
     id: DeviceId,
     /// ID server and key, if configured.
     server: Option<(String, DevicePublicKey)>,
-    /// Why the config cannot be used, if it cannot.
-    problem: Option<String>,
+    /// Why the config cannot be used, if it cannot: `None` inside means no
+    /// ID server is set at all.
+    problem: Option<Option<String>>,
+    /// The configured address, even when the key is unusable.
+    address: Option<String>,
     data_dir: Option<std::path::PathBuf>,
 }
 
@@ -77,21 +101,23 @@ impl Setup {
             .unwrap_or_else(Config::in_memory);
         let server = config.text("custom-rendezvous-server");
         let key = config.text("key");
+        let address = (!server.is_empty()).then(|| server.clone());
         let (server, problem) = if server.is_empty() || key.is_empty() {
-            (
-                None,
-                Some("no ID server is set; open Settings in the KanoDesk window".to_owned()),
-            )
+            (None, Some(None))
         } else {
             match key.parse::<DevicePublicKey>() {
                 Ok(k) => (Some((server, k)), None),
-                Err(e) => (None, Some(format!("the ID server key is not valid ({e})"))),
+                Err(e) => (
+                    None,
+                    Some(Some(format!("the ID server key is not valid ({e})"))),
+                ),
             }
         };
         Setup {
             id,
             server,
             problem,
+            address,
             data_dir: crate::paths::client_data_dir(),
         }
     }
@@ -109,6 +135,14 @@ impl Setup {
 enum UserEvent {
     Session(SessionEvent),
     Grabbed(GrabbedKey),
+    /// A screen reader asks for the UI tree or acts on it.
+    AccessKit(egui_winit::accesskit_winit::Event),
+}
+
+impl From<egui_winit::accesskit_winit::Event> for UserEvent {
+    fn from(e: egui_winit::accesskit_winit::Event) -> Self {
+        UserEvent::AccessKit(e)
+    }
 }
 
 /// What the user did in the toolbar or a dialog.
@@ -117,11 +151,21 @@ enum UiAction {
     SelectDisplay(u32),
     SetView(ViewStyle),
     SetQuality(ImageQuality),
-    CtrlAltDel,
+    /// A shortcut's command, chosen in the actions menu.
+    Command(ViewerCommand),
     SubmitPassword,
     Close,
     Retry,
     DismissRelay,
+    /// Open the main window's Settings.
+    OpenSettings,
+    /// Keep the fullscreen toolbar shown (or not).
+    PinToolbar(bool),
+}
+
+/// Whether Esc was pressed (and takes it, so nothing else sees it).
+fn escape(ui: &egui::Ui) -> bool {
+    ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
 }
 
 struct Gpu {
@@ -233,6 +277,16 @@ struct ViewerApp {
     drawn_at: Option<(f32, f32)>,
     next_repaint: Option<Instant>,
     recorded: bool,
+    /// Fullscreen (the toolbar floats over the video then).
+    fullscreen: bool,
+    /// The fullscreen toolbar stays shown.
+    toolbar_pinned: bool,
+    /// When the fullscreen toolbar was last wanted (pointer on it or at the top).
+    toolbar_wanted_at: Option<Instant>,
+    /// Whether the pointer was over the fullscreen toolbar last frame.
+    toolbar_hovered: bool,
+    /// Whether the password field got its focus for the current prompt.
+    password_focused: bool,
 }
 
 impl ViewerApp {
@@ -245,12 +299,14 @@ impl ViewerApp {
             view_from_config(&config.text("view-style")),
             quality_from_config(&config.text("image-quality")),
         );
+        let egui_ctx = egui::Context::default();
+        crate::theme::install(&egui_ctx);
         ViewerApp {
             setup,
             proxy,
             window: None,
             gpu: None,
-            egui_ctx: egui::Context::default(),
+            egui_ctx,
             egui_state: None,
             session: None,
             model,
@@ -268,16 +324,25 @@ impl ViewerApp {
             drawn_at: None,
             next_repaint: None,
             recorded: false,
+            fullscreen: false,
+            toolbar_pinned: false,
+            toolbar_wanted_at: None,
+            toolbar_hovered: false,
+            password_focused: false,
         }
     }
 
     /// Starts (or restarts) the session.
     fn start_session(&mut self) {
         let now = Instant::now();
+        self.model.server = self.setup.address.clone();
+        self.model.started(now);
         let Some((server, server_key)) = self.setup.server.clone() else {
-            let problem = self.setup.problem.clone().unwrap_or_default();
-            self.model
-                .apply(&SessionEvent::Ended(EndReason::IdServer(problem)), now);
+            let reason = match self.setup.problem.clone().flatten() {
+                Some(problem) => EndReason::Failed(problem),
+                None => EndReason::NoIdServer,
+            };
+            self.model.apply(&SessionEvent::Ended(reason), now);
             return;
         };
         let identity = match self.setup.identity() {
@@ -346,7 +411,7 @@ impl ViewerApp {
             return None;
         }
         let size = window.inner_size();
-        let top = (TOOLBAR as f64 * self.pixels_per_point())
+        let top = (self.toolbar_height() as f64 * self.pixels_per_point())
             .round()
             .min(size.height as f64);
         let display_size = self
@@ -362,6 +427,29 @@ impl ViewerApp {
             style: self.model.view,
             scroll: self.scroll,
         })
+    }
+
+    /// Points the docked toolbar takes at the top (none in fullscreen).
+    fn toolbar_height(&self) -> f32 {
+        if self.fullscreen { 0.0 } else { TOOLBAR }
+    }
+
+    /// Enters or leaves fullscreen; the video then fills the screen.
+    fn set_fullscreen(&mut self, on: bool, now: Instant) {
+        if let Some(w) = &self.window {
+            w.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
+        }
+        self.fullscreen = on;
+        self.toolbar_wanted_at = None;
+        self.toolbar_hovered = false;
+        self.scroll = (0.0, 0.0);
+        self.update_view();
+        if on {
+            self.model.toast(
+                "Fullscreen: the toolbar shows at the top edge (Ctrl+Alt+Shift+F to leave)",
+                now,
+            );
+        }
     }
 
     fn update_view(&mut self) {
@@ -417,9 +505,13 @@ impl ViewerApp {
 
     fn handle_key(&mut self, event_loop: &ActiveEventLoop, outcome: KeyOutcome) {
         self.send(outcome.events);
-        let Some(command) = outcome.command else {
-            return;
-        };
+        if let Some(command) = outcome.command {
+            self.run_command(event_loop, command);
+        }
+    }
+
+    /// A viewer command, from its shortcut or the actions menu.
+    fn run_command(&mut self, event_loop: &ActiveEventLoop, command: ViewerCommand) {
         let now = Instant::now();
         match command {
             ViewerCommand::CtrlAltDel => self.ctrl_alt_del(now),
@@ -451,6 +543,7 @@ impl ViewerApp {
                     now,
                 );
             }
+            ViewerCommand::ToggleFullscreen => self.set_fullscreen(!self.fullscreen, now),
         }
         self.refresh_cursor(event_loop);
         self.request_redraw();
@@ -650,6 +743,8 @@ impl ViewerApp {
                 self.record_recent();
             }
             SessionEvent::Displays(_) | SessionEvent::VideoStarted(_) => self.update_view(),
+            // A new prompt (or a wrong password) puts the cursor in the field.
+            SessionEvent::PasswordNeeded(_) => self.password_focused = false,
             SessionEvent::Ended(ref reason) => {
                 tracing::info!("session with {} ended: {reason:?}", self.setup.id.grouped());
                 self.input.set_permissions(Permissions::NONE);
@@ -673,7 +768,6 @@ impl ViewerApp {
     }
 
     fn apply_ui(&mut self, event_loop: &ActiveEventLoop, actions: Vec<UiAction>) {
-        let now = Instant::now();
         for action in actions {
             match action {
                 UiAction::SelectDisplay(d) => {
@@ -692,7 +786,7 @@ impl ViewerApp {
                         s.set_quality(q);
                     }
                 }
-                UiAction::CtrlAltDel => self.ctrl_alt_del(now),
+                UiAction::Command(c) => self.run_command(event_loop, c),
                 UiAction::SubmitPassword => {
                     if let Some(s) = &self.session {
                         s.send_password(Some(std::mem::take(&mut self.password)));
@@ -712,209 +806,501 @@ impl ViewerApp {
                     self.cursor = RemoteCursor::new();
                     self.video_size = (0, 0);
                     self.recorded = false;
+                    self.password_focused = false;
                     self.start_session();
                 }
                 UiAction::DismissRelay => self.model.relay_note = false,
+                UiAction::OpenSettings => {
+                    if let Err(e) = crate::paths::spawn_self(&["--settings"]) {
+                        tracing::warn!("opening Settings: {e}");
+                    }
+                }
+                UiAction::PinToolbar(pinned) => self.toolbar_pinned = pinned,
             }
         }
         self.refresh_cursor(event_loop);
         self.update_grab();
     }
 
-    /// The toolbar and the dialogs.
+    /// The toolbar, toasts and dialogs.
     fn ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
         let now = Instant::now();
         let ctx = ui.ctx().clone();
-        egui::Panel::top("toolbar")
-            .exact_size(TOOLBAR)
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    let streaming = self.model.phase == Phase::Streaming;
-                    let remote = self.model.remote.clone().unwrap_or_default();
-                    ui.strong(&self.model.id);
-                    ui.separator();
-                    if streaming && remote.multi_display && self.model.displays.len() > 1 {
-                        let current = self.model.display;
-                        let label = self
-                            .model
-                            .displays
-                            .iter()
-                            .enumerate()
-                            .find(|(_, d)| Some(d.id) == current)
-                            .map_or("Display".to_owned(), |(i, d)| display_label(i, d));
-                        egui::ComboBox::from_id_salt("display")
-                            .selected_text(label)
-                            .show_ui(ui, |ui| {
-                                for (i, d) in self.model.displays.iter().enumerate() {
-                                    if ui
-                                        .selectable_label(
-                                            Some(d.id) == current,
-                                            display_label(i, d),
-                                        )
-                                        .clicked()
-                                    {
-                                        actions.push(UiAction::SelectDisplay(d.id));
-                                    }
-                                }
-                            })
-                            .response
-                            .on_hover_text("Which remote display to show");
-                    }
-                    let view_word = match self.model.view {
-                        ViewStyle::Fit => "fit",
-                        ViewStyle::Original => "original",
-                    };
-                    egui::ComboBox::from_id_salt("view")
-                        .selected_text(view_label(view_word))
-                        .show_ui(ui, |ui| {
-                            for (style, word) in
-                                [(ViewStyle::Fit, "fit"), (ViewStyle::Original, "original")]
-                            {
-                                if ui
-                                    .selectable_label(self.model.view == style, view_label(word))
-                                    .clicked()
-                                {
-                                    actions.push(UiAction::SetView(style));
-                                }
-                            }
-                        });
-                    if !streaming || remote.image_quality {
-                        let word = crate::viewer_model::quality_word(self.model.quality);
-                        egui::ComboBox::from_id_salt("quality")
-                            .selected_text(quality_label(word))
-                            .show_ui(ui, |ui| {
-                                for q in [
-                                    ImageQuality::Balanced,
-                                    ImageQuality::Best,
-                                    ImageQuality::Low,
-                                ] {
-                                    let w = crate::viewer_model::quality_word(q);
-                                    if ui
-                                        .selectable_label(self.model.quality == q, quality_label(w))
-                                        .clicked()
-                                    {
-                                        actions.push(UiAction::SetQuality(q));
-                                    }
-                                }
-                            })
-                            .response
-                            .on_hover_text(
-                                "Image quality (shared by everyone viewing that display)",
-                            );
-                    }
-                    if ui
-                        .add_enabled(streaming, egui::Button::new("Ctrl+Alt+Del"))
-                        .on_hover_text("Send Ctrl+Alt+Del (also Ctrl+Alt+End)")
-                        .clicked()
-                    {
-                        actions.push(UiAction::CtrlAltDel);
-                    }
-                    ui.separator();
-                    ui.weak(self.model.status_text());
-                    if let Some(t) = self.model.current_toast(now) {
-                        ui.separator();
-                        ui.label(t);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Disconnect").clicked() {
-                            actions.push(UiAction::Close);
-                        }
-                    });
+        if self.fullscreen && self.model.phase == Phase::Streaming {
+            self.floating_toolbar(&ctx, actions, now);
+        } else {
+            let p = palette(ui);
+            egui::Panel::top("toolbar")
+                .exact_size(TOOLBAR)
+                .frame(
+                    Frame::new()
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.0, p.border))
+                        .inner_margin(Margin::symmetric(10, 0)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal_centered(|ui| self.toolbar_contents(ui, actions));
                 });
-            });
+        }
+        self.toast(&ctx, now);
 
         match self.model.phase.clone() {
-            Phase::Starting(stage) => {
-                egui::Modal::new(egui::Id::new("connecting")).show(&ctx, |ui| {
-                    ui.set_width(340.0);
-                    ui.heading(format!("Connecting to {}", self.model.id));
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(stage_text(stage));
-                    });
-                    ui.add_space(8.0);
-                    if ui.button("Cancel").clicked() {
-                        actions.push(UiAction::Close);
-                    }
-                });
-            }
-            Phase::Password(prompt) => {
-                egui::Modal::new(egui::Id::new("password")).show(&ctx, |ui| {
-                    ui.set_width(340.0);
-                    ui.heading(format!("Password for {}", self.model.id));
-                    ui.add_space(6.0);
-                    let text = password_text(prompt);
-                    if prompt == kanodesk_client::session::PasswordPrompt::Required {
-                        ui.label(text);
-                    } else {
-                        ui.colored_label(ui.visuals().error_fg_color, text);
-                    }
-                    let edit = ui.add(
-                        egui::TextEdit::singleline(&mut self.password)
-                            .password(true)
-                            .hint_text("password")
-                            .desired_width(f32::INFINITY),
-                    );
-                    edit.request_focus();
-                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let ok = !self.password.is_empty();
-                        if (ui.add_enabled(ok, egui::Button::new("Connect")).clicked() || enter)
-                            && ok
-                        {
-                            actions.push(UiAction::SubmitPassword);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            actions.push(UiAction::Close);
-                        }
-                    });
-                });
-            }
-            Phase::Ended(_) => {
-                let notice = self.model.end_notice().expect("ended");
-                egui::Modal::new(egui::Id::new("ended")).show(&ctx, |ui| {
-                    ui.set_width(380.0);
-                    if notice.error {
-                        ui.heading(
-                            egui::RichText::new(&notice.title).color(ui.visuals().error_fg_color),
-                        );
-                    } else {
-                        ui.heading(&notice.title);
-                    }
-                    ui.add_space(6.0);
-                    ui.label(&notice.text);
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if notice.retry && ui.button("Try again").clicked() {
-                            actions.push(UiAction::Retry);
-                        }
-                        if ui.button("Close").clicked() {
-                            actions.push(UiAction::Close);
-                        }
-                    });
-                });
-            }
+            Phase::Starting(stage) => self.connecting_dialog(&ctx, stage, actions, now),
+            Phase::Password(prompt) => self.password_dialog(&ctx, prompt, actions),
+            Phase::Ended(_) => self.end_dialog(&ctx, actions),
             Phase::Streaming => {
                 if self.model.relay_note {
                     egui::Window::new("Relayed connection")
                         .collapsible(false)
                         .resizable(false)
-                        .anchor(egui::Align2::CENTER_TOP, [0.0, TOOLBAR + 12.0])
+                        .anchor(Align2::CENTER_TOP, [0.0, self.toolbar_height() + 12.0])
                         .show(&ctx, |ui| {
+                            ui.set_max_width(420.0);
                             ui.label(
                                 "A direct connection was not possible, so the session goes \
                                  through the relay server. It is still end-to-end encrypted, \
                                  but may be slower.",
                             );
-                            if ui.button("OK").clicked() {
-                                actions.push(UiAction::DismissRelay);
-                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("OK").clicked() || escape(ui) {
+                                    actions.push(UiAction::DismissRelay);
+                                }
+                            });
                         });
                 }
             }
         }
+    }
+
+    /// The toolbar's row: ID, then the controls and chips while streaming.
+    fn toolbar_contents(&self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+        let p = palette(ui);
+        let spec = self.model.toolbar();
+        let remote = self.model.remote.clone().unwrap_or_default();
+        let narrow = ui.available_width() < NARROW;
+        ui.label(RichText::new(&self.model.id).strong().color(p.text_strong));
+        if !remote.hostname.is_empty() && !narrow {
+            ui.label(RichText::new(&remote.hostname).color(p.text_weak));
+        }
+        ui.separator();
+        if !spec.controls {
+            ui.label(RichText::new(&spec.status).color(p.text_weak));
+            return;
+        }
+        if remote.multi_display && self.model.displays.len() > 1 {
+            self.display_picker(ui, actions);
+        }
+        if !narrow {
+            self.view_picker(ui, actions);
+            if remote.image_quality {
+                self.quality_picker(ui, actions);
+            }
+        }
+        self.actions_menu(ui, actions, narrow, remote.image_quality);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if spec.disconnect && widgets::danger_button(ui, "Disconnect").clicked() {
+                actions.push(UiAction::Close);
+            }
+            if self.fullscreen {
+                let pinned = self.toolbar_pinned;
+                let tip = if pinned {
+                    "Let the toolbar hide"
+                } else {
+                    "Keep the toolbar shown"
+                };
+                let pin = ui
+                    .add(egui::Button::selectable(pinned, "📌"))
+                    .on_hover_text(tip);
+                if widgets::name_button(pin, tip).clicked() {
+                    actions.push(UiAction::PinToolbar(!pinned));
+                }
+            }
+            for chip in self.model.status_chips().iter().rev() {
+                widgets::chip(ui, chip.level, &chip.text);
+            }
+        });
+    }
+
+    fn display_picker(&self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+        let current = self.model.display;
+        let label = self
+            .model
+            .displays
+            .iter()
+            .enumerate()
+            .find(|(_, d)| Some(d.id) == current)
+            .map_or("Display".to_owned(), |(i, d)| display_label(i, d));
+        egui::ComboBox::from_id_salt("display")
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                for (i, d) in self.model.displays.iter().enumerate() {
+                    if ui
+                        .selectable_label(Some(d.id) == current, display_label(i, d))
+                        .clicked()
+                    {
+                        actions.push(UiAction::SelectDisplay(d.id));
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Which remote display to show");
+    }
+
+    fn view_choices(&self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+        for (style, word) in [(ViewStyle::Fit, "fit"), (ViewStyle::Original, "original")] {
+            if ui
+                .selectable_label(self.model.view == style, view_label(word))
+                .clicked()
+            {
+                actions.push(UiAction::SetView(style));
+                ui.close();
+            }
+        }
+    }
+
+    fn quality_choices(&self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+        for q in [
+            ImageQuality::Balanced,
+            ImageQuality::Best,
+            ImageQuality::Low,
+        ] {
+            let w = crate::viewer_model::quality_word(q);
+            if ui
+                .selectable_label(self.model.quality == q, quality_label(w))
+                .clicked()
+            {
+                actions.push(UiAction::SetQuality(q));
+                ui.close();
+            }
+        }
+    }
+
+    fn view_picker(&self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+        let word = match self.model.view {
+            ViewStyle::Fit => "fit",
+            ViewStyle::Original => "original",
+        };
+        egui::ComboBox::from_id_salt("view")
+            .selected_text(view_label(word))
+            .show_ui(ui, |ui| self.view_choices(ui, actions));
+    }
+
+    fn quality_picker(&self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+        let word = crate::viewer_model::quality_word(self.model.quality);
+        egui::ComboBox::from_id_salt("quality")
+            .selected_text(quality_label(word))
+            .show_ui(ui, |ui| self.quality_choices(ui, actions))
+            .response
+            .on_hover_text("Image quality (shared by everyone viewing that display)");
+    }
+
+    /// "⋯": the actions that otherwise only have shortcuts.
+    fn actions_menu(
+        &self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<UiAction>,
+        narrow: bool,
+        quality: bool,
+    ) {
+        let translate = self.input.keyboard_mode() == KeyboardMode::Translate;
+        let relative = self.input.relative_mouse();
+        let fullscreen = self.fullscreen;
+        let menu = ui.menu_button("⋯", |ui| {
+            ui.set_min_width(300.0);
+            let item = |ui: &mut egui::Ui, selected: Option<bool>, text: &str, keys: &str| {
+                let button = match selected {
+                    Some(s) => egui::Button::selectable(s, text),
+                    None => egui::Button::new(text),
+                };
+                ui.add(button.shortcut_text(keys)).clicked()
+            };
+            let mut command = None;
+            if item(ui, None, "Send Ctrl+Alt+Del", "Ctrl+Alt+End") {
+                command = Some(ViewerCommand::CtrlAltDel);
+            }
+            ui.separator();
+            if item(
+                ui,
+                Some(translate),
+                "Send characters as typed here",
+                "Ctrl+Alt+Shift+K",
+            ) {
+                command = Some(ViewerCommand::ToggleKeyboardMode);
+            }
+            if item(ui, Some(relative), "Relative mouse", "Ctrl+Alt+Shift+M") {
+                command = Some(ViewerCommand::ToggleRelativeMouse);
+            }
+            if item(ui, Some(fullscreen), "Fullscreen", "Ctrl+Alt+Shift+F") {
+                command = Some(ViewerCommand::ToggleFullscreen);
+            }
+            if let Some(c) = command {
+                actions.push(UiAction::Command(c));
+                ui.close();
+            }
+            if narrow {
+                ui.separator();
+                ui.menu_button("Remote screen", |ui| self.view_choices(ui, actions));
+                if quality {
+                    ui.menu_button("Image quality", |ui| self.quality_choices(ui, actions));
+                }
+            }
+        });
+        widgets::name_button(menu.response, "More actions").on_hover_text("More actions");
+    }
+
+    /// The fullscreen toolbar: a bar over the video's top edge, shown while
+    /// the pointer is at the top or on it (or pinned), with a small handle
+    /// otherwise.
+    fn floating_toolbar(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>, now: Instant) {
+        let ppp = self.pixels_per_point() as f32;
+        let pointer_y = self.pointer.map(|(_, y)| y as f32 / ppp);
+        let wanted = toolbar_wanted(
+            self.toolbar_pinned,
+            self.toolbar_hovered || egui::Popup::is_any_open(ctx),
+            pointer_y,
+        );
+        if wanted {
+            self.toolbar_wanted_at = Some(now);
+        }
+        let p = palette_for(ctx.theme() == egui::Theme::Dark);
+        if !toolbar_visible(wanted, self.toolbar_wanted_at, now) {
+            self.toolbar_hovered = false;
+            egui::Area::new(egui::Id::new("toolbar_handle"))
+                .anchor(Align2::CENTER_TOP, [0.0, 0.0])
+                .interactable(false)
+                .show(ctx, |ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(56.0, 6.0), egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        rect,
+                        CornerRadius {
+                            nw: 0,
+                            ne: 0,
+                            sw: 3,
+                            se: 3,
+                        },
+                        p.text_weak.gamma_multiply(0.7),
+                    );
+                });
+            return;
+        }
+        let width = ctx.content_rect().width();
+        let response = egui::Area::new(egui::Id::new("floating_toolbar"))
+            .anchor(Align2::CENTER_TOP, [0.0, 0.0])
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .inner_margin(Margin::symmetric(10, 0))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 20.0);
+                        ui.set_height(TOOLBAR);
+                        ui.horizontal_centered(|ui| self.toolbar_contents(ui, actions));
+                    });
+            })
+            .response;
+        self.toolbar_hovered = response.contains_pointer();
+        if !wanted {
+            ctx.request_repaint_after(TOOLBAR_LINGER);
+        }
+    }
+
+    /// The current toast, bottom centre, fading out at the end.
+    fn toast(&self, ctx: &egui::Context, now: Instant) {
+        let (Some(text), Some((_, at))) = (self.model.current_toast(now), &self.model.toast) else {
+            return;
+        };
+        let left = TOAST.saturating_sub(now.saturating_duration_since(*at));
+        let opacity = (left.as_secs_f32() / 0.5).clamp(0.0, 1.0);
+        let p = palette_for(ctx.theme() == egui::Theme::Dark);
+        egui::Area::new(egui::Id::new("toast"))
+            .anchor(Align2::CENTER_BOTTOM, [0.0, -28.0])
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.multiply_opacity(opacity);
+                Frame::new()
+                    .fill(p.surface_raised)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(CornerRadius::same(crate::theme::CARD_RADIUS))
+                    .inner_margin(Margin::symmetric(14, 8))
+                    .show(ui, |ui| {
+                        ui.set_max_width(480.0);
+                        ui.label(RichText::new(text).color(p.text_strong));
+                    });
+            });
+        ctx.request_repaint_after(if opacity < 1.0 {
+            Duration::from_millis(33)
+        } else {
+            left.saturating_sub(Duration::from_millis(500))
+        });
+    }
+
+    fn connecting_dialog(
+        &self,
+        ctx: &egui::Context,
+        stage: Stage,
+        actions: &mut Vec<UiAction>,
+        now: Instant,
+    ) {
+        let waited = self.model.stage_waited(now);
+        egui::Modal::new(egui::Id::new("connecting")).show(ctx, |ui| {
+            let p = palette(ui);
+            ui.set_width(380.0);
+            widgets::section_title(ui, &format!("Connecting to {}", self.model.id));
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(stage_text(stage));
+                if let Some(w) = waited_text(waited) {
+                    ui.label(RichText::new(w).color(p.text_weak));
+                }
+            });
+            if let Some(hint) = slow_hint(stage, waited, self.model.server.as_deref()) {
+                ui.label(RichText::new(hint).color(p.text_weak));
+            }
+            ui.add_space(4.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Cancel").clicked() {
+                    actions.push(UiAction::Close);
+                }
+            });
+            if escape(ui) {
+                actions.push(UiAction::Close);
+            }
+        });
+        // The elapsed time and the hint change on their own.
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
+    fn password_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        prompt: PasswordPrompt,
+        actions: &mut Vec<UiAction>,
+    ) {
+        // Focus the field once per prompt, so Tab can still reach the buttons.
+        let focus = !self.password_focused;
+        self.password_focused = true;
+        let id = self.model.id.clone();
+        let password = &mut self.password;
+        egui::Modal::new(egui::Id::new("password")).show(ctx, |ui| {
+            let p = palette(ui);
+            ui.set_width(380.0);
+            widgets::section_title(ui, &format!("Password for {id}"));
+            let color = if prompt == PasswordPrompt::Required {
+                p.text
+            } else {
+                p.danger_text
+            };
+            ui.label(RichText::new(password_text(prompt)).color(color));
+            let show_id = ui.id().with("show_password");
+            let mut show: bool = ui.data(|d| d.get_temp(show_id).unwrap_or(false));
+            let mut enter = false;
+            ui.horizontal(|ui| {
+                let toggle = 64.0;
+                let edit = ui.add(
+                    egui::TextEdit::singleline(password)
+                        .password(!show)
+                        .hint_text("password")
+                        .margin(crate::theme::FIELD_MARGIN)
+                        .desired_width(ui.available_width() - toggle - 8.0),
+                );
+                if focus {
+                    edit.request_focus();
+                }
+                enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                if ui
+                    .add(
+                        egui::Button::new(if show { "Hide" } else { "Show" })
+                            .min_size(egui::vec2(toggle, 0.0)),
+                    )
+                    .on_hover_text("Show or hide the password")
+                    .clicked()
+                {
+                    show = !show;
+                }
+            });
+            ui.data_mut(|d| d.insert_temp(show_id, show));
+            ui.add_space(4.0);
+            let ok = !password.is_empty();
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Cancel").clicked() {
+                    actions.push(UiAction::Close);
+                }
+                let connect = ui
+                    .add_enabled_ui(ok, |ui| widgets::primary_button(ui, "Connect"))
+                    .inner;
+                if (connect.clicked() || enter) && ok {
+                    actions.push(UiAction::SubmitPassword);
+                }
+            });
+            if escape(ui) {
+                actions.push(UiAction::Close);
+            }
+        });
+    }
+
+    fn end_dialog(&self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
+        let Some(notice) = self.model.end_notice() else {
+            return;
+        };
+        let settings = notice.action == Some(NoticeAction::OpenSettings);
+        // Enter runs the main button: Try again, else Open Settings, else Close.
+        let primary = if notice.retry {
+            UiAction::Retry
+        } else if settings {
+            UiAction::OpenSettings
+        } else {
+            UiAction::Close
+        };
+        egui::Modal::new(egui::Id::new("ended")).show(ctx, |ui| {
+            let p = palette(ui);
+            ui.set_width(400.0);
+            ui.horizontal(|ui| {
+                if notice.error {
+                    ui.label(RichText::new("⚠").heading().color(p.danger_text));
+                }
+                widgets::section_title(ui, &notice.title);
+            });
+            ui.label(&notice.text);
+            if settings && let Some(server) = &self.model.server {
+                ui.label(RichText::new(format!("ID server: {server}")).color(p.text_weak));
+            }
+            if let Some(detail) = &notice.detail {
+                egui::CollapsingHeader::new("Details")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(detail).monospace().color(p.text_weak))
+                                .selectable(true),
+                        );
+                        widgets::copy_button(ui, "detail", detail);
+                    });
+            }
+            ui.add_space(4.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let button = |ui: &mut egui::Ui, action: &UiAction, text: &str| {
+                    if *action == primary {
+                        widgets::primary_button(ui, text)
+                    } else {
+                        ui.button(text)
+                    }
+                };
+                if button(ui, &UiAction::Close, "Close").clicked() {
+                    actions.push(UiAction::Close);
+                }
+                if settings && button(ui, &UiAction::OpenSettings, "Open Settings").clicked() {
+                    actions.push(UiAction::OpenSettings);
+                }
+                if notice.retry && button(ui, &UiAction::Retry, "Try again").clicked() {
+                    actions.push(UiAction::Retry);
+                }
+            });
+            if escape(ui) {
+                actions.push(UiAction::Close);
+            } else if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+                actions.push(primary.clone());
+            }
+        });
     }
 
     fn render(&mut self, event_loop: &ActiveEventLoop) {
@@ -927,7 +1313,10 @@ impl ViewerApp {
         let raw = state.take_egui_input(&window);
         let ctx = self.egui_ctx.clone();
         let mut actions = Vec::new();
-        let full = ctx.run_ui(raw, |ui| self.ui(ui, &mut actions));
+        let mut full = ctx.run_ui(raw, |ui| self.ui(ui, &mut actions));
+        // egui insists (in debug builds) that texture changes are handled
+        // before they are dropped: take them, apply them, then clear them.
+        let mut textures = std::mem::take(&mut full.textures_delta);
         if let Some(state) = self.egui_state.as_mut() {
             state.handle_platform_output(&window, full.platform_output);
         }
@@ -946,8 +1335,11 @@ impl ViewerApp {
             None
         };
 
-        let Some(g) = self.gpu.as_mut() else { return };
-        for (id, deltas) in &full.textures_delta.set {
+        let Some(g) = self.gpu.as_mut() else {
+            textures.clear();
+            return;
+        };
+        for (id, deltas) in &textures.set {
             for delta in deltas {
                 g.egui.update_texture(&g.device, &g.queue, *id, delta);
             }
@@ -1003,9 +1395,10 @@ impl ViewerApp {
             g.queue.submit(extra.into_iter().chain([encoder.finish()]));
             g.queue.present(frame);
         }
-        for id in &full.textures_delta.free {
+        for id in &textures.free {
             g.egui.free_texture(id);
         }
+        textures.clear();
         if !actions.is_empty() {
             self.apply_ui(event_loop, actions);
             self.request_redraw();
@@ -1038,7 +1431,10 @@ impl ApplicationHandler<UserEvent> for ViewerApp {
         let attrs = Window::default_attributes()
             .with_title(self.model.title())
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
-            .with_min_inner_size(LogicalSize::new(480.0, 320.0));
+            .with_min_inner_size(LogicalSize::new(480.0, 320.0))
+            .with_window_icon(crate::icon::winit_icon())
+            // AccessKit has to be in place before the window shows.
+            .with_visible(false);
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -1050,15 +1446,18 @@ impl ApplicationHandler<UserEvent> for ViewerApp {
         match Gpu::new(window.clone()) {
             Ok(g) => {
                 let max = g.device.limits().max_texture_dimension_2d as usize;
-                self.egui_state = Some(egui_winit::State::new(
+                let mut state = egui_winit::State::new(
                     self.egui_ctx.clone(),
                     egui::ViewportId::ROOT,
                     &window,
                     Some(window.scale_factor() as f32),
                     window.theme(),
                     Some(max),
-                ));
+                );
+                state.init_accesskit(event_loop, &window, self.proxy.clone());
+                self.egui_state = Some(state);
                 self.gpu = Some(g);
+                window.set_visible(true);
             }
             Err(e) => {
                 tracing::error!("renderer: {e}");
@@ -1140,6 +1539,12 @@ impl ApplicationHandler<UserEvent> for ViewerApp {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
+                // Fullscreen may also end from outside (another app, the OS).
+                let fullscreen = window.fullscreen().is_some();
+                if fullscreen != self.fullscreen {
+                    self.fullscreen = fullscreen;
+                    self.toolbar_wanted_at = None;
+                }
                 if let Some(g) = self.gpu.as_mut() {
                     g.resize(size.width, size.height);
                 }
@@ -1226,6 +1631,22 @@ impl ApplicationHandler<UserEvent> for ViewerApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Session(e) => self.on_session_event(event_loop, e),
+            UserEvent::AccessKit(e) => {
+                use egui_winit::accesskit_winit::WindowEvent as Ak;
+                match e.window_event {
+                    Ak::InitialTreeRequested => {
+                        self.egui_ctx.enable_accesskit();
+                        self.request_redraw();
+                    }
+                    Ak::ActionRequested(request) => {
+                        if let Some(state) = self.egui_state.as_mut() {
+                            state.on_accesskit_action_request(request);
+                        }
+                        self.request_redraw();
+                    }
+                    Ak::AccessibilityDeactivated => self.egui_ctx.disable_accesskit(),
+                }
+            }
             UserEvent::Grabbed(key) => {
                 if !self.forwarding() {
                     return;

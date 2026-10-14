@@ -7,6 +7,8 @@
 //!   [`main_model`]): this device's ID and one-time password, a connect
 //!   box, recent sessions and settings. It starts the host process if none
 //!   runs.
+//!   `kanodesk --settings` opens it on Settings (a viewer's error dialog
+//!   does that for ID-server problems).
 //! - `kanodesk --connect ID`: a viewer window ([`viewer`], state in
 //!   [`viewer_model`]): the remote screen with a toolbar (display, fit or
 //!   original size, quality, Ctrl+Alt+Del, disconnect) and the status and
@@ -18,6 +20,9 @@
 //!   [`cm_model`]): who is connecting, Accept/Deny, live permissions,
 //!   Disconnect.
 //! - `kanodesk --cm-cmd …`: the same from the command line ([`cm_cli`]).
+//!
+//! All windows share one look: [`theme`] (colours, text sizes, spacing),
+//! [`widgets`] (buttons, cards, status lines) and [`icon`].
 //!
 //! The windows are thin: sessions live in `kanodesk_client::session`, the
 //! host in `kanodesk_host`. The main window and the CM use egui through
@@ -35,12 +40,15 @@
 pub mod cm;
 pub mod cm_cli;
 pub mod cm_model;
+pub mod icon;
 pub mod main_model;
 pub mod main_window;
 pub mod paths;
 pub mod server;
+pub mod theme;
 pub mod viewer;
 pub mod viewer_model;
+pub mod widgets;
 
 /// Package version, shown by the binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -57,6 +65,7 @@ pub const SPEC_DOCS: &[&str] = &[
 
 const USAGE: &str = "usage:
   kanodesk                      the main window
+  kanodesk --settings           the main window, on Settings
   kanodesk --connect ID         a viewer window for the device with this ID
   kanodesk --server [--config FILE] [--data-dir DIR] [--listen ADDR] [--port N]
                     [--approve-mode password|click|both] [--display N] [--no-cm-launch]
@@ -70,6 +79,8 @@ const USAGE: &str = "usage:
 pub enum Role {
     /// The main window.
     Main,
+    /// The main window, opened on Settings (from a viewer's error dialog).
+    Settings,
     /// A viewer window for this device ID.
     Connect(kanodesk_rendezvous::DeviceId),
     /// The host process.
@@ -86,6 +97,8 @@ pub enum Role {
 pub fn parse_role(args: &[String]) -> Result<Role, String> {
     match args.first().map(String::as_str) {
         None => Ok(Role::Main),
+        Some("--settings") if args.len() == 1 => Ok(Role::Settings),
+        Some("--settings") => Err("--settings takes no arguments".into()),
         Some("--connect") => match &args[1..] {
             [id] => id
                 .parse()
@@ -137,7 +150,8 @@ pub fn main_with_args(args: &[String]) -> i32 {
         }
     };
     match parse_role(args) {
-        Ok(Role::Main) => report("", main_window::run()),
+        Ok(Role::Main) => report("", main_window::run(main_model::Page::Home)),
+        Ok(Role::Settings) => report(" --settings", main_window::run(main_model::Page::Settings)),
         Ok(Role::Connect(id)) => {
             init_logging(paths::log_dir().map(|d| d.join("viewer.log")).as_deref());
             report(" --connect", viewer::run(id))
@@ -183,6 +197,8 @@ mod tests {
         let a = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(parse_role(&a(&[])).unwrap(), Role::Main);
         assert_eq!(parse_role(&a(&["--help"])).unwrap(), Role::Help);
+        assert_eq!(parse_role(&a(&["--settings"])).unwrap(), Role::Settings);
+        assert!(parse_role(&a(&["--settings", "x"])).is_err());
         assert_eq!(parse_role(&a(&["--cm"])).unwrap(), Role::Cm);
         assert!(parse_role(&a(&["--cm", "x"])).is_err());
         assert_eq!(

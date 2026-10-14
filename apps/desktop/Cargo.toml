@@ -12,11 +12,15 @@ name = "kanodesk"
 path = "src/main.rs"
 test = false
 
+[build-dependencies]
+embed-resource.workspace = true
+
 [dependencies]
 eframe.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
-egui-winit.workspace = true
+# AccessKit: the viewer's dialogs and toolbar reach screen readers.
+egui-winit = { workspace = true, features = ["accesskit"] }
 kanodesk-client.workspace = true
 kanodesk-config.workspace = true
 kanodesk-crypto.workspace = true
@@ -39,7 +43,7 @@ winit.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { workspace = true, features = ["x11", "wayland"] }
 egui-wgpu = { workspace = true, features = ["x11", "wayland"] }
-egui-winit = { workspace = true, features = ["x11", "wayland"] }
+egui-winit = { workspace = true, features = ["x11", "wayland", "accesskit"] }
 
 [lints]
 workspace = true

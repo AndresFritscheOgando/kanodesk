@@ -154,6 +154,20 @@ impl CmModel {
         self.entries.values()
     }
 
+    /// The sessions as the window lists them: requests waiting for an
+    /// answer first, then active sessions, then ended ones; oldest first
+    /// within each.
+    pub fn ordered(&self) -> Vec<&Entry> {
+        let rank = |e: &Entry| match e.info.state {
+            SessionState::AwaitingApproval { .. } => 0,
+            SessionState::Active => 1,
+            SessionState::Ended { .. } => 2,
+        };
+        let mut list: Vec<&Entry> = self.entries.values().collect();
+        list.sort_by_key(|e| rank(e));
+        list
+    }
+
     /// Whether the window has nothing left to show: a session was shown,
     /// none is live, and the last one ended at least `after` ago.
     pub fn done(&self, now: Instant, after: Duration) -> bool {
@@ -218,6 +232,21 @@ pub fn accept_enabled(info: &SessionInfo, now_unix_ms: u64) -> bool {
     }
 }
 
+/// How much of a waiting request's answer time is left, from 1.0 when
+/// it arrived down to 0.0; `None` when it is not waiting or never expires.
+pub fn expiry_fraction(info: &SessionInfo, now_unix_ms: u64) -> Option<f32> {
+    match info.state {
+        SessionState::AwaitingApproval {
+            expires_unix_ms, ..
+        } if expires_unix_ms != u64::MAX => {
+            let total = expires_unix_ms.saturating_sub(info.started_unix_ms).max(1);
+            let left = expires_unix_ms.saturating_sub(now_unix_ms).min(total);
+            Some(left as f32 / total as f32)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +278,39 @@ mod tests {
             accept_after_unix_ms: accept_after,
             expires_unix_ms: accept_after + 60_000,
         }
+    }
+
+    #[test]
+    fn expiry_and_order() {
+        let mut s = session(1, waiting(2_000));
+        s.started_unix_ms = 2_000;
+        // waiting(): expires 60 s after accept_after.
+        assert_eq!(expiry_fraction(&s, 2_000), Some(1.0));
+        assert_eq!(expiry_fraction(&s, 32_000), Some(0.5));
+        assert_eq!(expiry_fraction(&s, 90_000), Some(0.0));
+        assert_eq!(expiry_fraction(&s, 0), Some(1.0), "clock behind");
+        s.state = SessionState::AwaitingApproval {
+            accept_after_unix_ms: 0,
+            expires_unix_ms: u64::MAX,
+        };
+        assert_eq!(expiry_fraction(&s, 5), None, "never expires");
+        assert_eq!(expiry_fraction(&session(2, SessionState::Active), 5), None);
+
+        let mut m = CmModel::default();
+        let t = Instant::now();
+        m.apply(HostToCm::Session(session(1, SessionState::Active)), t);
+        m.apply(
+            HostToCm::Session(session(
+                2,
+                SessionState::Ended {
+                    reason: "bye".into(),
+                },
+            )),
+            t,
+        );
+        m.apply(HostToCm::Session(session(3, waiting(0))), t);
+        let ids: Vec<u64> = m.ordered().iter().map(|e| e.info.id).collect();
+        assert_eq!(ids, [3, 1, 2], "request, active, ended");
     }
 
     fn status() -> HostStatus {

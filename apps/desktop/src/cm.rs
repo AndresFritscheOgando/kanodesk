@@ -6,7 +6,9 @@
 //! - **Accept** or **Deny** a waiting session, choosing its keyboard and
 //!   mouse permissions first. Accept stays disabled for the host's
 //!   anti-spoof delay, so a remote viewer cannot click it the moment the
-//!   request appears;
+//!   request appears, and it has no keyboard shortcut. A bar shows how
+//!   long the request waits for an answer. Requests are listed first and
+//!   stand out with an accent border;
 //! - toggle an active session's permissions live;
 //! - **Disconnect** a session (the host closes it and its video at once).
 //!
@@ -22,7 +24,12 @@ use kanodesk_ipc::cm::{
 };
 use tokio::sync::mpsc;
 
-use crate::cm_model::{Attention, CmModel, accept_enabled};
+use egui::{CornerRadius, Frame, Margin, RichText, Stroke};
+
+use crate::cm_model::{Attention, CmModel, Entry, accept_enabled, expiry_fraction};
+use crate::main_model::Level;
+use crate::theme::{CARD_RADIUS, palette};
+use crate::widgets;
 
 /// Close the window this long after the last session ended.
 const CLOSE_AFTER: Duration = Duration::from_secs(5);
@@ -35,7 +42,8 @@ pub fn run() -> Result<(), String> {
         viewport: egui::ViewportBuilder::default()
             .with_title("KanoDesk: incoming connections")
             .with_inner_size([440.0, 560.0])
-            .with_min_inner_size([360.0, 300.0]),
+            .with_min_inner_size([360.0, 300.0])
+            .with_icon(Arc::new(crate::icon::egui_icon())),
         ..Default::default()
     };
     let ipc_model = model.clone();
@@ -43,6 +51,7 @@ pub fn run() -> Result<(), String> {
         "KanoDesk connection manager",
         options,
         Box::new(move |cc| {
+            crate::theme::install(&cc.egui_ctx);
             spawn_ipc(ipc_model, out_rx, cc.egui_ctx.clone());
             Ok(Box::new(CmApp { model, out }))
         }),
@@ -150,34 +159,158 @@ fn elapsed(started_unix_ms: u64, now_unix_ms: u64) -> String {
 fn permission_boxes(ui: &mut egui::Ui, current: Perms) -> Option<Perms> {
     let mut p = current;
     ui.horizontal(|ui| {
+        ui.label("Allow:");
         ui.checkbox(&mut p.keyboard, "Keyboard");
         ui.checkbox(&mut p.mouse, "Mouse");
     });
     (p != current).then_some(p)
 }
 
+/// "with the temporary password", "accepted by you".
+fn login_text(info: &SessionInfo) -> String {
+    match &info.password {
+        Some(p) => format!("with the {p} password"),
+        None => "accepted by you".to_owned(),
+    }
+}
+
 impl CmApp {
     fn header(ui: &mut egui::Ui, model: &CmModel) {
         if !model.connected {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
+            widgets::banner_text(
+                ui,
+                Level::Busy,
                 "Not connected to the KanoDesk host. Retrying…",
             );
             return;
         }
         if let Some(s) = &model.status {
-            ui.label(format!("This computer: {}", short_key(&s.device_key)));
-            match s.approve_mode.as_str() {
-                "click" => ui.label("Viewers connect when you accept them."),
-                "both" => ui.label("Viewers need the password and your acceptance."),
-                _ => ui.label("Viewers connect with the password."),
-            };
+            let p = palette(ui);
+            ui.label(match s.approve_mode.as_str() {
+                "click" => "Viewers connect when you accept them.",
+                "both" => "Viewers need the password and your acceptance.",
+                _ => "Viewers connect with the password.",
+            });
             if let Some(pw) = &s.temporary_password {
                 ui.horizontal(|ui| {
-                    ui.label("One-time password:");
-                    ui.monospace(pw);
+                    ui.label(RichText::new("One-time password").color(p.text_weak));
+                    ui.label(RichText::new(pw).monospace().color(p.text_strong));
+                    widgets::copy_button(ui, "password", pw);
                 });
             }
+        }
+    }
+
+    /// A request waiting for Accept or Deny.
+    fn request(
+        ui: &mut egui::Ui,
+        model: &CmModel,
+        e: &Entry,
+        now_ms: u64,
+        actions: &mut Vec<CmToHost>,
+        choices: &mut Vec<(u64, Perms)>,
+    ) {
+        let p = palette(ui);
+        let info = &e.info;
+        let SessionState::AwaitingApproval {
+            accept_after_unix_ms,
+            expires_unix_ms,
+        } = info.state
+        else {
+            return;
+        };
+        ui.label(
+            RichText::new(format!("{} wants to control this computer", describe(info)))
+                .strong()
+                .color(p.text_strong),
+        );
+        let mut line = format!("from {}", info.address);
+        if !info.agent.is_empty() {
+            line.push_str(&format!(" · {}", info.agent));
+        }
+        if let Some(pw) = &info.password {
+            line.push_str(&format!(" · used the {pw} password"));
+        }
+        ui.label(RichText::new(line).small().color(p.text_weak))
+            .on_hover_text(format!(
+                "Device fingerprint: {}",
+                short_key(&info.device_key)
+            ));
+        if let Some(c) = permission_boxes(ui, e.choice) {
+            choices.push((info.id, c));
+        }
+        ui.horizontal(|ui| {
+            let enabled = accept_enabled(info, now_ms);
+            let wait = accept_after_unix_ms.saturating_sub(now_ms);
+            let label = if enabled {
+                "Accept".to_owned()
+            } else {
+                format!("Accept ({})", wait.div_ceil(1000))
+            };
+            let accept = ui
+                .add_enabled_ui(enabled, |ui| widgets::primary_button(ui, &label))
+                .inner;
+            if accept.clicked()
+                && let Some(a) = model.accept(info.id, now_ms)
+            {
+                actions.push(a);
+            }
+            if widgets::danger_button(ui, "Deny").clicked()
+                && let Some(a) = model.deny(info.id)
+            {
+                actions.push(a);
+            }
+        });
+        if let Some(f) = expiry_fraction(info, now_ms) {
+            let fill = if f < 0.25 { p.warn } else { p.accent_text };
+            ui.add(egui::ProgressBar::new(f).desired_height(4.0).fill(fill));
+            let left = expires_unix_ms.saturating_sub(now_ms).div_ceil(1000);
+            ui.label(
+                RichText::new(format!("Ends without an answer in {left} s"))
+                    .small()
+                    .color(p.text_weak),
+            );
+        }
+    }
+
+    /// A running session: its permissions and Disconnect.
+    fn active(
+        ui: &mut egui::Ui,
+        model: &CmModel,
+        e: &Entry,
+        now_ms: u64,
+        actions: &mut Vec<CmToHost>,
+    ) {
+        let p = palette(ui);
+        let info = &e.info;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(describe(info)).strong().color(p.text_strong));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::danger_button(ui, "Disconnect").clicked()
+                    && let Some(a) = model.disconnect(info.id)
+                {
+                    actions.push(a);
+                }
+            });
+        });
+        ui.label(
+            RichText::new(format!(
+                "Connected {} · {}",
+                elapsed(info.started_unix_ms, now_ms),
+                login_text(info)
+            ))
+            .small()
+            .color(p.text_weak),
+        )
+        .on_hover_text(format!(
+            "from {} · device fingerprint {}",
+            info.address,
+            short_key(&info.device_key)
+        ));
+        if let Some(perms) = permission_boxes(ui, info.permissions)
+            && let Some(a) = model.set_permissions(info.id, perms)
+        {
+            actions.push(a);
         }
     }
 }
@@ -188,90 +321,65 @@ impl eframe::App for CmApp {
         let now_ms = unix_ms(SystemTime::now());
         let mut actions: Vec<CmToHost> = Vec::new();
         let mut choices: Vec<(u64, Perms)> = Vec::new();
+        let p = palette(ui);
         let done = {
             let mut model = self.model.lock().expect("not poisoned");
             model.prune(now);
-            egui::CentralPanel::default().show(ui, |ui| {
-                Self::header(ui, &model);
-                ui.separator();
-                if model.entries().next().is_none() {
-                    ui.label("No one is connected.");
-                }
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for e in model.entries() {
-                        let info = &e.info;
-                        ui.group(|ui| {
-                            ui.set_width(ui.available_width());
-                            ui.strong(describe(info));
-                            ui.small(format!(
-                                "from {} · device {} · {}",
-                                info.address,
-                                short_key(&info.device_key),
-                                info.agent
-                            ));
-                            match &info.state {
-                                SessionState::AwaitingApproval {
-                                    accept_after_unix_ms,
-                                    expires_unix_ms,
-                                } => {
-                                    ui.label(match &info.password {
-                                        Some(p) => format!(
-                                            "wants to control this computer (used the {p} password)"
-                                        ),
-                                        None => "wants to control this computer".to_owned(),
-                                    });
-                                    if let Some(p) = permission_boxes(ui, e.choice) {
-                                        choices.push((info.id, p));
-                                    }
-                                    ui.horizontal(|ui| {
-                                        let enabled = accept_enabled(info, now_ms);
-                                        let wait = accept_after_unix_ms.saturating_sub(now_ms);
-                                        let label = if enabled {
-                                            "Accept".to_owned()
-                                        } else {
-                                            format!("Accept ({})", wait.div_ceil(1000))
-                                        };
-                                        if ui
-                                            .add_enabled(enabled, egui::Button::new(label))
-                                            .clicked()
-                                            && let Some(a) = model.accept(info.id, now_ms)
-                                        {
-                                            actions.push(a);
+            egui::CentralPanel::default()
+                .frame(Frame::new().fill(p.bg).inner_margin(Margin::same(16)))
+                .show(ui, |ui| {
+                    Self::header(ui, &model);
+                    ui.add_space(8.0);
+                    if model.entries().next().is_none() {
+                        ui.label(RichText::new("No one is connected.").color(p.text_weak));
+                    }
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for e in model.ordered() {
+                                // A request stands out; an ended session fades.
+                                let stroke = if e.awaiting() {
+                                    Stroke::new(2.0, p.accent_text)
+                                } else {
+                                    Stroke::new(1.0, p.border)
+                                };
+                                Frame::new()
+                                    .fill(p.surface)
+                                    .stroke(stroke)
+                                    .corner_radius(CornerRadius::same(CARD_RADIUS))
+                                    .inner_margin(Margin::same(14))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        match &e.info.state {
+                                            SessionState::AwaitingApproval { .. } => Self::request(
+                                                ui,
+                                                &model,
+                                                e,
+                                                now_ms,
+                                                &mut actions,
+                                                &mut choices,
+                                            ),
+                                            SessionState::Active => {
+                                                Self::active(ui, &model, e, now_ms, &mut actions)
+                                            }
+                                            SessionState::Ended { reason } => {
+                                                ui.multiply_opacity(0.6);
+                                                ui.label(
+                                                    RichText::new(describe(&e.info))
+                                                        .color(p.text_strong),
+                                                );
+                                                ui.label(
+                                                    RichText::new(format!("Ended: {reason}"))
+                                                        .small()
+                                                        .color(p.text_weak),
+                                                );
+                                            }
                                         }
-                                        if ui.button("Deny").clicked()
-                                            && let Some(a) = model.deny(info.id)
-                                        {
-                                            actions.push(a);
-                                        }
-                                        let left = expires_unix_ms.saturating_sub(now_ms) / 1000;
-                                        ui.small(format!("{left} s left"));
                                     });
-                                }
-                                SessionState::Active => {
-                                    ui.label(format!(
-                                        "connected {} · password: {}",
-                                        elapsed(info.started_unix_ms, now_ms),
-                                        info.password.as_deref().unwrap_or("none (accepted)")
-                                    ));
-                                    if let Some(p) = permission_boxes(ui, info.permissions)
-                                        && let Some(a) = model.set_permissions(info.id, p)
-                                    {
-                                        actions.push(a);
-                                    }
-                                    if ui.button("Disconnect").clicked()
-                                        && let Some(a) = model.disconnect(info.id)
-                                    {
-                                        actions.push(a);
-                                    }
-                                }
-                                SessionState::Ended { reason } => {
-                                    ui.weak(format!("Ended: {reason}"));
-                                }
+                                ui.add_space(10.0);
                             }
                         });
-                    }
                 });
-            });
             for (id, p) in choices {
                 model.choose(id, p);
             }
@@ -318,5 +426,9 @@ mod tests {
         assert_eq!(describe(&info), "Unknown computer");
         assert_eq!(short_key("0123456789abcdef0123"), "0123456789abcdef…");
         assert_eq!(elapsed(0, 3_723_000), "01:02:03");
+        info.password = Some("temporary".into());
+        assert_eq!(login_text(&info), "with the temporary password");
+        info.password = None;
+        assert_eq!(login_text(&info), "accepted by you");
     }
 }

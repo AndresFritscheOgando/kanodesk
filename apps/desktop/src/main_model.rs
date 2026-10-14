@@ -15,6 +15,19 @@ pub const MIN_PERMANENT: usize = 8;
 /// How long a reply from the host stays on screen.
 pub const REPLY_SHOWN: Duration = Duration::from_secs(8);
 
+/// How a status is doing; picks its colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// Working: online, connected.
+    Ok,
+    /// On its way: connecting, retrying soon.
+    Busy,
+    /// Needs the user: offline, not set up, failed.
+    Problem,
+    /// Neutral information.
+    Idle,
+}
+
 /// The link to the host process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostLink {
@@ -121,16 +134,40 @@ impl MainModel {
 pub const VIEWER_ONLY_TEXT: &str = "This computer can control other desks, but others cannot connect to it: \
      sharing this screen needs Windows for now.";
 
+/// The ID-server status as the main window shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkStatus {
+    /// The dot's colour.
+    pub level: Level,
+    /// Next to the dot: "Online", "Connecting…", "Offline", "Not set up".
+    pub short: &'static str,
+    /// The sentence under the ID.
+    pub text: String,
+    /// The raw error, for the tooltip.
+    pub detail: Option<String>,
+    /// Whether to offer "Open Settings".
+    pub settings: bool,
+}
+
 /// What "This desk" says on a viewer-only window about the ID server.
-pub fn viewer_link_text(config: &Config) -> (String, bool) {
+pub fn viewer_link_status(config: &Config) -> LinkStatus {
     let server = config.text("custom-rendezvous-server");
     if server.is_empty() || config.text("key").is_empty() {
-        (
-            "No ID server set: open Settings to set one before connecting".to_owned(),
-            true,
-        )
+        LinkStatus {
+            level: Level::Problem,
+            short: "Not set up",
+            text: "Set an ID server in Settings before connecting.".to_owned(),
+            detail: None,
+            settings: true,
+        }
     } else {
-        (format!("ID server: {server}"), false)
+        LinkStatus {
+            level: Level::Idle,
+            short: "Ready",
+            text: format!("ID server: {server}"),
+            detail: None,
+            settings: false,
+        }
     }
 }
 
@@ -142,16 +179,51 @@ pub fn id_text(overview: &HostOverview) -> String {
     }
 }
 
-/// How the ID-server link is doing, and whether that is a problem.
-pub fn link_text(overview: &HostOverview) -> (String, bool) {
+/// How the host's ID-server link is doing.
+pub fn link_status(overview: &HostOverview) -> LinkStatus {
+    let server = overview
+        .id_server_address
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("the ID server");
+    let status = |level, short, text: String| LinkStatus {
+        level,
+        short,
+        text,
+        detail: None,
+        settings: false,
+    };
     match &overview.id_server {
-        IdServerState::Online => ("Ready: reachable by ID".to_owned(), false),
-        IdServerState::Connecting => ("Connecting to the ID server…".to_owned(), false),
-        IdServerState::NotConfigured => (
-            "No ID server set: open Settings to set one".to_owned(),
-            true,
+        IdServerState::Online => status(
+            Level::Ok,
+            "Online",
+            "Others can reach this desk by its ID.".to_owned(),
         ),
-        IdServerState::Failed(e) => (format!("ID server: {e} (retrying)"), true),
+        IdServerState::Connecting => status(
+            Level::Busy,
+            "Connecting…",
+            format!("Connecting to {server}…"),
+        ),
+        IdServerState::NotConfigured => LinkStatus {
+            settings: true,
+            ..status(
+                Level::Problem,
+                "Not set up",
+                "Set an ID server in Settings so others can reach this desk.".to_owned(),
+            )
+        },
+        IdServerState::Failed(e) => LinkStatus {
+            detail: Some(e.clone()),
+            settings: true,
+            ..status(
+                Level::Problem,
+                "Offline",
+                format!(
+                    "Can't reach {server}: it {}. Retrying automatically.",
+                    kanodesk_client::session::plain_cause(e)
+                ),
+            )
+        },
     }
 }
 
@@ -172,6 +244,27 @@ pub fn parse_target(text: &str) -> Result<DeviceId, String> {
     }
     t.parse::<DeviceId>()
         .map_err(|_| "An ID is 9 digits, like 123 456 789.".to_owned())
+}
+
+/// The connect box as typed: keeps up to 9 digits and groups them in
+/// threes ("123456" → "123 456"); anything else (spaces, dashes, "ID:")
+/// is dropped, so pasted IDs work.
+pub fn format_id_input(text: &str) -> String {
+    let digits: Vec<char> = text.chars().filter(char::is_ascii_digit).take(9).collect();
+    let mut out = String::new();
+    for (i, d) in digits.iter().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(' ');
+        }
+        out.push(*d);
+    }
+    out
+}
+
+/// "6 of 9 digits" while the connect box is incomplete.
+pub fn id_progress(text: &str) -> Option<String> {
+    let n = text.chars().filter(char::is_ascii_digit).count();
+    (1..9).contains(&n).then(|| format!("{n} of 9 digits"))
 }
 
 /// "just now", "5 min ago", "3 h ago", "2 days ago".
@@ -238,7 +331,9 @@ impl SettingsForm {
     pub fn apply(&self, config: &mut Config) -> Result<(), Vec<String>> {
         let mut problems = Vec::new();
         let server = self.id_server.trim();
-        let key = self.server_key.trim();
+        // The key field wraps, and pasted keys may carry line breaks.
+        let key: String = self.server_key.split_whitespace().collect();
+        let key = key.as_str();
         if server.is_empty() != key.is_empty() {
             problems.push("Set both the ID server address and its key (or neither).".to_owned());
         }
@@ -286,6 +381,17 @@ impl SettingsForm {
         Ok(())
     }
 
+    /// Whether the saved fields differ from `saved` (the permanent password
+    /// fields do not count: they apply on their own).
+    pub fn differs_from(&self, saved: &SettingsForm) -> bool {
+        let strip = |f: &SettingsForm| SettingsForm {
+            new_password: String::new(),
+            confirm_password: String::new(),
+            ..f.clone()
+        };
+        strip(self) != strip(saved)
+    }
+
     /// The request that sets the permanent password, if the two fields agree.
     pub fn permanent_password_request(&self) -> Result<UiToHost, String> {
         if self.new_password.chars().count() < MIN_PERMANENT {
@@ -299,6 +405,51 @@ impl SettingsForm {
         Ok(UiToHost::SetPermanentPassword(Some(
             self.new_password.clone(),
         )))
+    }
+}
+
+/// What to say under the server key field while it is typed, and how.
+pub fn key_hint(text: &str) -> Option<(Level, String)> {
+    let key: String = text.split_whitespace().collect();
+    let n = key.chars().count();
+    if n == 0 {
+        None
+    } else if !key.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some((
+            Level::Problem,
+            "Only 0–9 and a–f are allowed in the key.".to_owned(),
+        ))
+    } else if n < 64 {
+        Some((Level::Idle, format!("{n} of 64 characters")))
+    } else if n > 64 {
+        Some((
+            Level::Problem,
+            format!("Too long: a key is 64 characters, this is {n}."),
+        ))
+    } else if key.parse::<DevicePublicKey>().is_ok() {
+        Some((Level::Ok, "✔ Valid key".to_owned()))
+    } else {
+        Some((Level::Problem, "This is not a valid server key.".to_owned()))
+    }
+}
+
+/// What to say under the ID server field while it is typed, and how.
+pub fn server_hint(text: &str) -> Option<(Level, String)> {
+    let t = text.trim();
+    if t.is_empty() {
+        None
+    } else if t.contains(char::is_whitespace) {
+        Some((
+            Level::Problem,
+            "The address cannot contain spaces.".to_owned(),
+        ))
+    } else if t.contains(':') {
+        None
+    } else {
+        Some((
+            Level::Idle,
+            "Port 21116 is used when none is given.".to_owned(),
+        ))
     }
 }
 
@@ -360,26 +511,54 @@ mod tests {
         assert!(!VIEWER_ONLY_TEXT.contains("  "), "one space between words");
 
         let mut config = Config::in_memory();
-        let (text, problem) = viewer_link_text(&config);
-        assert!(problem && text.contains("Settings"), "{text}");
+        let s = viewer_link_status(&config);
+        assert!(s.level == Level::Problem && s.settings, "{s:?}");
+        assert!(s.text.contains("Settings"), "{}", s.text);
         config.set("custom-rendezvous-server", "10.0.0.31").unwrap();
-        assert!(viewer_link_text(&config).1, "the key is missing");
-        config.set("key", KEY).unwrap();
         assert_eq!(
-            viewer_link_text(&config),
-            ("ID server: 10.0.0.31".to_owned(), false)
+            viewer_link_status(&config).level,
+            Level::Problem,
+            "the key is missing"
         );
+        config.set("key", KEY).unwrap();
+        let s = viewer_link_status(&config);
+        assert_eq!(
+            (s.level, s.text.as_str()),
+            (Level::Idle, "ID server: 10.0.0.31")
+        );
+        assert!(!s.settings);
     }
 
     #[test]
     fn texts() {
         let mut o = HostOverview::default();
         assert_eq!(id_text(&o), "— — —");
-        assert!(link_text(&o).1, "not configured is a problem");
+        let s = link_status(&o);
+        assert_eq!((s.level, s.short), (Level::Problem, "Not set up"));
+        assert!(s.settings && s.detail.is_none());
         o.id_server = IdServerState::Online;
-        assert_eq!(link_text(&o), ("Ready: reachable by ID".into(), false));
-        o.id_server = IdServerState::Failed("timed out".into());
-        assert!(link_text(&o).0.contains("timed out"));
+        let s = link_status(&o);
+        assert_eq!((s.level, s.short, s.settings), (Level::Ok, "Online", false));
+        o.id_server = IdServerState::Connecting;
+        assert_eq!(link_status(&o).text, "Connecting to the ID server…");
+        o.id_server_address = Some("10.0.0.31".into());
+        let s = link_status(&o);
+        assert_eq!(
+            (s.level, s.text.as_str()),
+            (Level::Busy, "Connecting to 10.0.0.31…")
+        );
+        o.id_server = IdServerState::Failed("transport: connection: timed out".into());
+        let s = link_status(&o);
+        assert_eq!((s.level, s.short), (Level::Problem, "Offline"));
+        assert_eq!(
+            s.text,
+            "Can't reach 10.0.0.31: it did not answer. Retrying automatically."
+        );
+        assert_eq!(
+            s.detail.as_deref(),
+            Some("transport: connection: timed out")
+        );
+        assert!(s.settings);
         o.status = HostStatus {
             approve_mode: "click".into(),
             ..Default::default()
@@ -403,6 +582,27 @@ mod tests {
         assert!(parse_target("").unwrap_err().contains("Enter"));
         assert!(parse_target("12345").unwrap_err().contains("9 digits"));
         assert!(parse_target("abc").is_err());
+        assert_eq!(
+            parse_target("123-456-789").unwrap(),
+            "123456789".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn connect_box_formatting() {
+        assert_eq!(format_id_input(""), "");
+        assert_eq!(format_id_input("12"), "12");
+        assert_eq!(format_id_input("123"), "123");
+        assert_eq!(format_id_input("1234"), "123 4");
+        assert_eq!(format_id_input("123456789"), "123 456 789");
+        assert_eq!(format_id_input("123-456-789"), "123 456 789");
+        assert_eq!(format_id_input("ID: 123 456 789"), "123 456 789");
+        assert_eq!(format_id_input("1234567890123"), "123 456 789", "at most 9");
+        assert_eq!(format_id_input("abc"), "");
+        assert_eq!(format_id_input("123 456 78"), "123 456 78");
+        assert_eq!(id_progress(""), None);
+        assert_eq!(id_progress("123 4"), Some("4 of 9 digits".into()));
+        assert_eq!(id_progress("123 456 789"), None);
     }
 
     #[test]
@@ -447,6 +647,64 @@ mod tests {
         none.server_key.clear();
         none.apply(&mut config).unwrap();
         assert_eq!(config.text("key"), "");
+    }
+
+    #[test]
+    fn settings_hints_and_changes() {
+        assert_eq!(key_hint(""), None);
+        assert_eq!(
+            key_hint(
+                "  
+ "
+            ),
+            None
+        );
+        assert_eq!(
+            key_hint(&KEY[..10]),
+            Some((Level::Idle, "10 of 64 characters".into()))
+        );
+        assert_eq!(key_hint(KEY).unwrap().0, Level::Ok);
+        let split = format!(
+            "{} 
+{}",
+            &KEY[..32],
+            &KEY[32..]
+        );
+        assert_eq!(
+            key_hint(&split).unwrap().0,
+            Level::Ok,
+            "line breaks are ignored"
+        );
+        assert_eq!(key_hint("xyz").unwrap().0, Level::Problem);
+        assert!(
+            key_hint(&format!("{KEY}00"))
+                .unwrap()
+                .1
+                .contains("Too long")
+        );
+        assert_eq!(server_hint(""), None);
+        assert_eq!(server_hint("ids.example.com:21116"), None);
+        assert_eq!(server_hint("ids.example.com").unwrap().0, Level::Idle);
+        assert_eq!(server_hint("ids example").unwrap().0, Level::Problem);
+
+        // A key pasted over two lines is saved in one piece.
+        let mut config = Config::in_memory();
+        let mut f = SettingsForm::from_config(&config);
+        f.id_server = "10.0.0.31".into();
+        f.server_key = split;
+        f.apply(&mut config).unwrap();
+        assert_eq!(config.text("key"), KEY);
+
+        let saved = SettingsForm::from_config(&config);
+        let mut f = saved.clone();
+        assert!(!f.differs_from(&saved));
+        f.new_password = "typed but not set".into();
+        assert!(
+            !f.differs_from(&saved),
+            "password fields apply on their own"
+        );
+        f.approve_mode = "click".into();
+        assert!(f.differs_from(&saved));
     }
 
     #[test]
